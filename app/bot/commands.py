@@ -567,21 +567,9 @@ class CommandRouter:
                 self.bot.send_message(chat_id, f"⚠️ 知识库「{kb_name}」没有关联的代码库。")
                 return
 
-            # Show pending/failed block stats
-            pending_count = session.execute(
-                select(func.count(CodeBlock.id)).where(
-                    CodeBlock.repo_id.in_([r.id for r in repos]),
-                    CodeBlock.status.in_(["pending", "failed"]),
-                )
-            ).scalar() or 0
-
             repo_ids = [r.id for r in repos]
 
-        self.bot.send_message(
-            chat_id,
-            f"🔄 正在恢复构建知识库「{kb_name}」"
-            f"（{pending_count} 个代码块待处理）...",
-        )
+        self.bot.send_message(chat_id, f"🔄 正在恢复构建知识库「{kb_name}」...")
 
         for rid in repo_ids:
             self._async_repo_analysis(rid, chat_id)

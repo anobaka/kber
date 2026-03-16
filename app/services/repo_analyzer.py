@@ -303,7 +303,7 @@ class RepoAnalyzer:
             repo_map = self._generate_repo_map(repo_dir, all_files)
 
             if blocks_to_generate:
-                _notify(f"🤖 正在生成知识摘要（共 {len(blocks_to_generate)} 个代码块）...")
+                _notify("🤖 正在生成知识摘要...")
 
                 success_entries, failed_count = self._generate_block_knowledge(
                     blocks_to_generate, repo_map, kb_id, repo_id, current_commit,
