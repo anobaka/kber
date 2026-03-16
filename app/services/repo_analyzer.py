@@ -228,18 +228,21 @@ class RepoAnalyzer:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _inject_pat(url: str) -> str:
-        """Inject PAT into an HTTPS git URL for authentication.
+    def _build_clone_url(repo_path: str) -> str:
+        """Build a full authenticated clone URL.
 
-        Looks up the PAT by hostname from GIT_PAT_MAP, falling back to GIT_PAT.
-        Converts https://gitlab.myco.com/org/repo.git
-             to https://{PAT}@gitlab.myco.com/org/repo.git
+        repo_path is either a full URL or a short path like ``org/repo``.
+        When GIT_BASE_URL is configured, short paths are expanded to
+        ``{GIT_BASE_URL}/{repo_path}.git``.  The PAT is injected into
+        the HTTPS URL for authentication.
         """
-        from urllib.parse import urlparse
+        url = repo_path
+        # Expand short path → full URL
+        if not url.startswith("http://") and not url.startswith("https://"):
+            base = config.GIT_BASE_URL.rstrip("/")
+            url = f"{base}/{url.strip('/')}.git"
 
-        parsed = urlparse(url)
-        host = parsed.hostname or ""
-        pat = config.get_pat_for_host(host)
+        pat = config.GIT_PAT
         if not pat:
             return url
         if url.startswith("https://"):
@@ -250,7 +253,7 @@ class RepoAnalyzer:
 
     def _git_clone(self, url: str, dest: str, branch: str) -> None:
         os.makedirs(dest, exist_ok=True)
-        auth_url = self._inject_pat(url)
+        auth_url = self._build_clone_url(url)
         subprocess.run(
             ["git", "clone", "-b", branch, auth_url, dest],
             check=True,

@@ -24,8 +24,9 @@ from app.services.rag_service import rag_service
 
 logger = logging.getLogger(__name__)
 
-GIT_URL_PATTERN = re.compile(
-    r"^(https?://[\w.\-/]+\.git|https?://[\w.\-/]+)$"
+# Accepts full HTTPS URL or short path like "org/repo" or "org/repo.git"
+GIT_REPO_PATTERN = re.compile(
+    r"^(https?://[\w.\-/]+|[\w.\-]+/[\w.\-/]+)$"
 )
 
 
@@ -147,11 +148,11 @@ class CommandRouter:
 
     def _bind_repo(self, chat_id: str, sender_id: str, git_url: str) -> None:
         if not git_url:
-            self.bot.send_message(chat_id, "⚠️ 代码库地址不能为空，请使用格式：绑定代码库 {git地址}")
+            self.bot.send_message(chat_id, "⚠️ 代码库地址不能为空，请使用格式：绑定代码库 {org/repo}")
             return
 
-        if not GIT_URL_PATTERN.match(git_url):
-            self.bot.send_message(chat_id, "⚠️ Git 地址格式不正确，请使用 https://... 格式。")
+        if not GIT_REPO_PATTERN.match(git_url):
+            self.bot.send_message(chat_id, "⚠️ 格式不正确，请使用 org/repo 或 https://... 格式。")
             return
 
         with get_session() as session:
@@ -393,8 +394,8 @@ class CommandRouter:
 
 **绑定知识库** {名称}　— 将本群聊天记录纳入指定知识库
 **解绑知识库** {名称}　— 解除本群与知识库的绑定
-**绑定代码库** {git地址}　— 关联代码库并自动分析
-**解绑代码库** {git地址}　— 解除代码库关联
+**绑定代码库** {org/repo}　— 关联代码库并自动分析
+**解绑代码库** {org/repo}　— 解除代码库关联
 **添加知识** {内容}　— 手动向知识库添加一条知识
 **帮助**　— 显示本帮助信息
 
