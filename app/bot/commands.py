@@ -19,6 +19,7 @@ from app.db.models import (
     ManualKnowledge,
     SummarizeTaskLog,
 )
+from app.config import config
 from app.db.session import get_session
 from app.services.milvus_service import milvus_service
 from app.services.rag_service import rag_service
@@ -29,6 +30,31 @@ logger = logging.getLogger(__name__)
 GIT_REPO_PATTERN = re.compile(
     r"^(https?://[\w.\-/]+|[\w.\-]+/[\w.\-/]+)$"
 )
+
+
+def normalize_git_url(raw: str) -> str:
+    """Normalize a git repo identifier to a canonical short path.
+
+    If the input is a full URL that matches ``GIT_BASE_URL``, strip the base
+    and trailing ``.git`` to produce the short ``org/repo`` form.  Otherwise
+    return the input unchanged (with trailing ``.git`` stripped).
+    """
+    url = raw.strip().rstrip("/")
+
+    # Full URL → try to reduce to short path
+    if url.startswith("http://") or url.startswith("https://"):
+        base = config.GIT_BASE_URL.rstrip("/")
+        if base:
+            for prefix in (base + "/", base.replace("https://", "http://") + "/"):
+                if url.startswith(prefix):
+                    url = url[len(prefix):]
+                    break
+
+    # Strip trailing .git
+    if url.endswith(".git"):
+        url = url[:-4]
+
+    return url.strip("/")
 
 
 class CommandRouter:
@@ -153,12 +179,17 @@ class CommandRouter:
 
     def _bind_repo(self, chat_id: str, sender_id: str, git_url: str) -> None:
         if not git_url:
-            self.bot.send_message(chat_id, "⚠️ 代码库地址不能为空，请使用格式：绑定代码库 {org/repo}")
+            self.bot.send_message(
+                chat_id,
+                "⚠️ 代码库地址不能为空，请使用格式：绑定代码库 org/repo 或 绑定代码库 https://...",
+            )
             return
 
         if not GIT_REPO_PATTERN.match(git_url):
             self.bot.send_message(chat_id, "⚠️ 格式不正确，请使用 org/repo 或 https://... 格式。")
             return
+
+        git_url = normalize_git_url(git_url)
 
         with get_session() as session:
             # Find or create repo
@@ -171,7 +202,7 @@ class CommandRouter:
 
             if not repo:
                 # Create a code-type knowledge base for this repo
-                repo_name = git_url.split("/")[-1].replace(".git", "")
+                repo_name = git_url.split("/")[-1]
                 kb = KnowledgeBase(
                     name=repo_name,
                     kb_type="code",
@@ -215,6 +246,8 @@ class CommandRouter:
         if not git_url:
             self.bot.send_message(chat_id, "⚠️ 代码库地址不能为空。")
             return
+
+        git_url = normalize_git_url(git_url)
 
         with get_session() as session:
             repo = session.execute(
@@ -417,8 +450,8 @@ class CommandRouter:
 
 **绑定知识库** {名称}　— 将本群聊天记录纳入指定知识库
 **解绑知识库** {名称}　— 解除本群与知识库的绑定
-**绑定代码库** {org/repo}　— 关联代码库并自动分析
-**解绑代码库** {org/repo}　— 解除代码库关联
+**绑定代码库** {org/repo 或 完整URL}　— 关联代码库并自动分析
+**解绑代码库** {org/repo 或 完整URL}　— 解除代码库关联
 **添加知识** {内容}　— 手动向知识库添加一条知识
 **帮助**　— 显示本帮助信息
 
