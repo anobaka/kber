@@ -30,7 +30,7 @@ class EmbeddingService:
         """Embed a single text string."""
         return self.embed_batch([text])[0]
 
-    def embed_batch(self, texts: list[str], batch_size: int = 20) -> list[list[float]]:
+    def embed_batch(self, texts: list[str], batch_size: int = 10) -> list[list[float]]:
         """Embed a batch of texts, handling API limits."""
         all_vectors: list[list[float]] = []
         for i in range(0, len(texts), batch_size):
