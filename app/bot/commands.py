@@ -90,6 +90,8 @@ class CommandRouter:
             self._set_debug(chat_id, sender_id, True)
         elif text == "disable-debug":
             self._set_debug(chat_id, sender_id, False)
+        elif text in ("我的ID", "我的id", "myid"):
+            self.bot.send_message(chat_id, f"你的用户 ID：`{sender_id}`")
         elif text in ("帮助", "help"):
             self._show_help(chat_id)
         else:
@@ -569,6 +571,7 @@ class CommandRouter:
 **绑定代码库** {org/repo 或 完整URL}　— 关联代码库并自动分析
 **解绑代码库** {org/repo 或 完整URL}　— 解除代码库关联
 **添加知识** [知识库名称] {内容}　— 手动添加知识（单知识库时可省略名称）
+**我的ID**　— 获取你的用户 ID（用于申请管理员权限）
 **帮助**　— 显示本帮助信息
 
 🔒 **管理员命令：**
