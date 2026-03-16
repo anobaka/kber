@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 # Lazy reference to avoid circular imports; set by bot startup.
 _send_fn: Callable[[str, str], str | None] | None = None
 _update_fn: Callable[[str, str], bool] | None = None
+_send_progress_fn: Callable[[str, str], str | None] | None = None
 
 # Per-chat last progress message_id for in-place updates.
 # Key: (context_type, context_id, chat_id) → message_id
@@ -33,6 +34,12 @@ def set_update_fn(fn: Callable[[str, str], bool]) -> None:
     _update_fn = fn
 
 
+def set_send_progress_fn(fn: Callable[[str, str], str | None]) -> None:
+    """Register the bot's send_progress_card function (called once at startup)."""
+    global _send_progress_fn
+    _send_progress_fn = fn
+
+
 def _send(chat_id: str, message: str) -> str | None:
     if _send_fn is None:
         return None
@@ -49,14 +56,18 @@ def _send_or_update(
     context_type: str,
     context_id: Any,
 ) -> None:
-    """Send a new message or update the previous progress message in-place."""
+    """Send a progress card or update the previous one in-place.
+
+    Feishu only supports editing card (interactive) messages, so progress
+    notifications are sent as cards via *_send_progress_fn*.
+    """
     key = (context_type, context_id, chat_id)
     full_msg = f"🔧 {message}"
 
     with _progress_lock:
         prev_id = _progress_msg_ids.get(key)
 
-    # Try updating the previous message first
+    # Try updating the previous card message first
     if prev_id and _update_fn:
         try:
             if _update_fn(prev_id, full_msg):
@@ -64,11 +75,12 @@ def _send_or_update(
         except Exception:
             logger.debug("Update failed, will send new message", exc_info=True)
 
-    # Fallback: send a new message
-    if _send_fn is None:
+    # Fallback: send a new progress card (must be card type for future edits)
+    send = _send_progress_fn or _send_fn
+    if send is None:
         return
     try:
-        msg_id = _send_fn(chat_id, full_msg)
+        msg_id = send(chat_id, full_msg)
         if msg_id:
             with _progress_lock:
                 _progress_msg_ids[key] = msg_id

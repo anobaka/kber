@@ -48,11 +48,12 @@ class FeishuBot:
     def start(self, message_handler: Any) -> None:
         """Start the WebSocket long connection to receive messages."""
         from app.bot.commands import CommandRouter
-        from app.services.debug_notifier import set_send_fn, set_update_fn
+        from app.services.debug_notifier import set_send_fn, set_send_progress_fn, set_update_fn
 
         # Register send/update functions for debug notifications
         set_send_fn(self.send_message)
         set_update_fn(self.update_message)
+        set_send_progress_fn(self.send_progress_card)
 
         router = CommandRouter(self)
 
@@ -192,14 +193,17 @@ class FeishuBot:
             return None
 
     def update_message(self, message_id: str, text: str) -> bool:
-        """Update an existing Feishu message in-place. Returns True on success."""
+        """Update an existing Feishu card message in-place. Returns True on success.
+
+        Note: Feishu only supports updating interactive (card) messages.
+        """
         try:
-            content = json.dumps({"text": text})
+            card_json = self._build_progress_card(text)
             request = PatchMessageRequest.builder() \
                 .message_id(message_id) \
                 .request_body(
                     PatchMessageRequestBody.builder()
-                    .content(content)
+                    .content(card_json)
                     .build()
                 ) \
                 .build()
@@ -212,6 +216,21 @@ class FeishuBot:
         except Exception:
             logger.exception("Failed to update message %s", message_id)
             return False
+
+    def send_progress_card(self, chat_id: str, text: str) -> str | None:
+        """Send a progress card that can be updated in-place later. Returns message_id."""
+        return self.send_message(chat_id, self._build_progress_card(text), msg_type="interactive")
+
+    @staticmethod
+    def _build_progress_card(text: str) -> str:
+        """Build a minimal card JSON for progress notifications."""
+        card = {
+            "config": {"wide_screen_mode": True},
+            "elements": [
+                {"tag": "markdown", "content": text},
+            ],
+        }
+        return json.dumps(card)
 
     def send_card(self, chat_id: str, title: str, content: str) -> None:
         """Send an interactive card message."""
