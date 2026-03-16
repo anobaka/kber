@@ -231,10 +231,15 @@ class RepoAnalyzer:
     def _inject_pat(url: str) -> str:
         """Inject PAT into an HTTPS git URL for authentication.
 
-        Converts https://github.com/org/repo.git
-             to https://{PAT}@github.com/org/repo.git
+        Looks up the PAT by hostname from GIT_PAT_MAP, falling back to GIT_PAT.
+        Converts https://gitlab.myco.com/org/repo.git
+             to https://{PAT}@gitlab.myco.com/org/repo.git
         """
-        pat = config.GIT_PAT
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+        pat = config.get_pat_for_host(host)
         if not pat:
             return url
         if url.startswith("https://"):

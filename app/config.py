@@ -1,5 +1,6 @@
 """Application configuration loaded from environment variables."""
 
+import json
 import os
 from dotenv import load_dotenv
 
@@ -44,8 +45,15 @@ class Config:
     EMBEDDING_DIM: int = int(os.getenv("EMBEDDING_DIM", "1024"))
 
     # --- Git / Repo ---
-    GIT_PAT: str = os.getenv("GIT_PAT", "")  # Personal Access Token for HTTPS clone
+    # PAT per host: JSON mapping {"github.com": "ghp_xxx", "gitlab.myco.com": "glpat-xxx"}
+    # Falls back to GIT_PAT as default for any host not in the map.
+    GIT_PAT: str = os.getenv("GIT_PAT", "")
+    GIT_PAT_MAP: dict[str, str] = json.loads(os.getenv("GIT_PAT_MAP", "{}"))
     REPOS_BASE_DIR: str = os.getenv("REPOS_BASE_DIR", "/data/repos")
+
+    def get_pat_for_host(self, host: str) -> str:
+        """Return the PAT for a given git host, falling back to GIT_PAT."""
+        return self.GIT_PAT_MAP.get(host, self.GIT_PAT)
 
     # --- Redis (optional) ---
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")

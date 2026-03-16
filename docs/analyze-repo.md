@@ -20,7 +20,7 @@
 - 增量更新：`git fetch origin` 获取最新代码，通过 `git diff {last_commit_hash}..origin/{branch} --name-status` 确定变更文件列表，再 `git pull` 合并
 - 克隆目录：`/data/repos/{repo_id}/`
 - 记录当前 `commit_hash` 到 `code_repo.last_commit_hash`
-- **私有仓库认证**：从应用配置中读取 Personal Access Token (PAT)，自动注入到 HTTPS URL 中（`https://{PAT}@github.com/...`）。配置项：`GIT_PAT`
+- **私有仓库认证**：从应用配置中读取 Personal Access Token (PAT)，按域名匹配后自动注入到 HTTPS URL 中（`https://{PAT}@gitlab.myco.com/...`）。配置项：`GIT_PAT`（默认 PAT）、`GIT_PAT_MAP`（按域名配置不同 PAT，JSON 格式，如 `{"github.com": "ghp_xxx", "gitlab.myco.com": "glpat-xxx"}`）
 
 ### 3.2 文件过滤
 
