@@ -19,6 +19,7 @@ from app.db.models import (
     SummarizeTaskLog,
 )
 from app.db.session import get_session
+from app.services.cancel import CancelledError, check_cancelled
 from app.services.embedding_service import embedding_service
 from app.services.llm_service import llm_service
 from app.services.milvus_service import milvus_service
@@ -63,6 +64,8 @@ class MessageAnalyzer:
 
             _dbg(f"开始归纳：{len(messages)} 条消息，{len(manual_entries)} 条手动知识")
 
+            check_cancelled(kb_id)
+
             # Process manual knowledge immediately
             for mk in manual_entries:
                 mk_stats = self._process_manual_knowledge(kb_id, mk)
@@ -83,6 +86,8 @@ class MessageAnalyzer:
 
             _dbg(f"过滤后 {len(meaningful)} 条有效消息，开始话题分组...")
 
+            check_cancelled(kb_id)
+
             # Format messages for LLM
             messages_text = self._format_messages(meaningful)
 
@@ -93,6 +98,7 @@ class MessageAnalyzer:
             # Process each topic group
             processed_msg_ids: list[str] = []
             for group in topic_groups:
+                check_cancelled(kb_id)
                 group_stats = self._process_topic_group(kb_id, group)
                 for k in stats:
                     stats[k] += group_stats.get(k, 0)
@@ -111,6 +117,12 @@ class MessageAnalyzer:
                 f"归纳完成：新增 {stats['new']}，更新 {stats['updated']}，"
                 f"删除 {stats['deleted']}，跳过 {stats['skipped']}"
             )
+
+        except CancelledError:
+            logger.info("Summarization cancelled for kb_id=%d", kb_id)
+            self._finish_task_log(task_log_id, "failed", stats, "用户取消")
+            _dbg("🛑 归纳任务已停止。")
+            raise
 
         except Exception as e:
             logger.exception("Summarization failed for kb_id=%d", kb_id)

@@ -60,6 +60,14 @@ def normalize_git_url(raw: str) -> str:
     return url.strip("/")
 
 
+from app.services.cancel import (
+    CancelledError,
+    check_cancelled,
+    clear_cancel_event,
+    get_cancel_event,
+)
+
+
 class CommandRouter:
     """Routes incoming user commands to the appropriate handler."""
 
@@ -86,6 +94,8 @@ class CommandRouter:
             self._query_kb_status(chat_id, sender_id)
         elif text.startswith("重建知识库"):
             self._rebuild_kb(chat_id, sender_id, text[len("重建知识库"):].strip())
+        elif text.startswith("停止构建"):
+            self._stop_build(chat_id, sender_id, text[len("停止构建"):].strip())
         elif text == "enable-debug":
             self._set_debug(chat_id, sender_id, True)
         elif text == "disable-debug":
@@ -477,6 +487,35 @@ class CommandRouter:
         else:
             self._async_summarize(kb_id)
 
+    def _stop_build(self, chat_id: str, sender_id: str, kb_name: str) -> None:
+        if not self._is_admin(sender_id):
+            self.bot.send_message(chat_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
+            return
+
+        if not kb_name:
+            self.bot.send_message(chat_id, "⚠️ 请指定知识库名称，格式：停止构建 {名称}")
+            return
+
+        with get_session() as session:
+            kb = session.execute(
+                select(KnowledgeBase).where(
+                    KnowledgeBase.name == kb_name,
+                    KnowledgeBase.deleted_at.is_(None),
+                )
+            ).scalar_one_or_none()
+
+        if not kb:
+            self.bot.send_message(chat_id, f"⚠️ 未找到知识库「{kb_name}」。")
+            return
+
+        ev = get_cancel_event(kb.id)
+        if ev.is_set():
+            self.bot.send_message(chat_id, f"ℹ️ 知识库「{kb_name}」的构建任务已在停止中。")
+            return
+
+        ev.set()
+        self.bot.send_message(chat_id, f"🛑 正在停止知识库「{kb_name}」的构建任务...")
+
     def _query_kb_status(self, chat_id: str, sender_id: str) -> None:
         if not self._is_admin(sender_id):
             self.bot.send_message(chat_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
@@ -577,6 +616,7 @@ class CommandRouter:
 🔒 **管理员命令：**
 **立即总结**　— 立即触发知识归纳任务
 **重建知识库** {名称}　— 清除并重建指定知识库
+**停止构建** {名称}　— 停止正在构建的知识库任务
 **查询知识库**　— 查看所有知识库状态
 **enable-debug**　— 开启本群 Debug 模式（显示详细工作进度）
 **disable-debug**　— 关闭本群 Debug 模式
@@ -627,22 +667,46 @@ class CommandRouter:
 
     def _async_summarize(self, kb_id: int) -> None:
         """Trigger async summarization for a KB."""
+        # Reset any previous cancellation and register a fresh event
+        clear_cancel_event(kb_id)
+        get_cancel_event(kb_id)
+
         def _run() -> None:
             try:
                 from app.services.message_analyzer import message_analyzer
                 message_analyzer.run_for_kb(kb_id)
+            except CancelledError:
+                logger.info("Summarize cancelled for kb_id=%d", kb_id)
             except Exception:
                 logger.exception("Summarize failed for kb_id=%d", kb_id)
+            finally:
+                clear_cancel_event(kb_id)
 
         threading.Thread(target=_run, daemon=True).start()
 
     def _async_repo_analysis(self, repo_id: int, chat_id: str) -> None:
         """Trigger async repo analysis."""
+        # Resolve kb_id for cancellation tracking
+        with get_session() as session:
+            repo = session.execute(
+                select(CodeRepo).where(CodeRepo.id == repo_id)
+            ).scalar_one_or_none()
+            kb_id = repo.kb_id if repo else None
+
+        if kb_id:
+            clear_cancel_event(kb_id)
+            get_cancel_event(kb_id)
+
         def _run() -> None:
             try:
                 from app.services.repo_analyzer import repo_analyzer
                 repo_analyzer.analyze_repo(repo_id, notify_chat_ids=[chat_id])
+            except CancelledError:
+                logger.info("Repo analysis cancelled for repo_id=%d", repo_id)
             except Exception:
                 logger.exception("Repo analysis failed for repo_id=%d", repo_id)
+            finally:
+                if kb_id:
+                    clear_cancel_event(kb_id)
 
         threading.Thread(target=_run, daemon=True).start()

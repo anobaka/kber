@@ -34,6 +34,7 @@ from sqlalchemy import delete, select, update
 from app.config import config
 from app.db.models import CodeBlock, CodeRepo, KnowledgeBase, SummarizeTaskLog
 from app.db.session import get_session
+from app.services.cancel import CancelledError, check_cancelled
 from app.services.embedding_service import embedding_service
 from app.services.llm_service import llm_service
 from app.services.milvus_service import milvus_service
@@ -172,6 +173,10 @@ class RepoAnalyzer:
             branch = repo.default_branch or ""
             last_commit = repo.last_commit_hash
 
+        def _check() -> None:
+            if kb_id:
+                check_cancelled(kb_id)
+
         repo_dir = os.path.join(config.REPOS_BASE_DIR, str(repo_id))
         task_log_id = self._start_task_log(kb_id, "code")
 
@@ -191,6 +196,7 @@ class RepoAnalyzer:
             # ----------------------------------------------------------
             # Step 1: Git clone / pull
             # ----------------------------------------------------------
+            _check()
             _notify("📦 正在同步代码仓库...")
 
             is_new = not os.path.exists(os.path.join(repo_dir, ".git"))
@@ -210,6 +216,7 @@ class RepoAnalyzer:
             # ----------------------------------------------------------
             # Step 2: Scan & filter files
             # ----------------------------------------------------------
+            _check()
             _notify("🔍 正在扫描文件...")
 
             all_files = self._scan_files(repo_dir)
@@ -226,10 +233,12 @@ class RepoAnalyzer:
             # ----------------------------------------------------------
             # Step 3: AST parse → code blocks
             # ----------------------------------------------------------
+            _check()
             new_blocks: list[dict[str, Any]] = []
             parse_throttle = _ProgressThrottle(total_files)
             for i, fpath in enumerate(files_to_process):
                 if parse_throttle.should_notify(i + 1):
+                    _check()
                     pct = (i + 1) * 100 // total_files
                     _notify(f"🔍 正在解析代码结构（{pct}%，{i + 1}/{total_files} 个文件）...")
                 blocks = self._parse_file(fpath, repo_dir, repo_id)
@@ -239,6 +248,7 @@ class RepoAnalyzer:
             # ----------------------------------------------------------
             # Step 4: Upsert code_block records, detect what needs LLM
             # ----------------------------------------------------------
+            _check()
             blocks_to_generate = self._sync_code_blocks(
                 repo_id, new_blocks, current_commit, changed_files,
             )
@@ -252,6 +262,7 @@ class RepoAnalyzer:
             # ----------------------------------------------------------
             # Step 5: LLM knowledge generation (block level)
             # ----------------------------------------------------------
+            _check()
             repo_map = self._generate_repo_map(repo_dir, all_files)
 
             if blocks_to_generate:
@@ -259,7 +270,7 @@ class RepoAnalyzer:
 
                 success_entries, failed_count = self._generate_block_knowledge(
                     blocks_to_generate, repo_map, kb_id, repo_id, current_commit,
-                    notify_fn=_notify,
+                    notify_fn=_notify, check_cancelled_fn=_check,
                 )
                 stats["blocks_success"] = len(success_entries)
                 stats["blocks_failed"] = failed_count
@@ -276,6 +287,7 @@ class RepoAnalyzer:
             # ----------------------------------------------------------
             # Step 6: Module summaries (cascading)
             # ----------------------------------------------------------
+            _check()
             affected_dirs = self._get_affected_modules(
                 repo_id, blocks_to_generate, changed_files,
             )
@@ -283,12 +295,14 @@ class RepoAnalyzer:
                 _notify(f"📝 正在更新 {len(affected_dirs)} 个模块摘要...")
                 updated = self._regenerate_module_summaries(
                     kb_id, repo_id, affected_dirs, repo_map, _notify,
+                    check_cancelled_fn=_check,
                 )
                 stats["modules_updated"] = updated
 
             # ----------------------------------------------------------
             # Step 7: Repo overview (regenerate if anything changed)
             # ----------------------------------------------------------
+            _check()
             if blocks_to_generate or affected_dirs:
                 _notify("📋 正在更新仓库概览...")
                 self._regenerate_repo_overview(kb_id, repo_id, repo_map)
@@ -304,6 +318,14 @@ class RepoAnalyzer:
             if stats["modules_updated"]:
                 summary_parts.append(f"更新 {stats['modules_updated']} 个模块摘要")
             _notify(f"✅ 代码库分析完成！{'，'.join(summary_parts)}。")
+
+        except CancelledError:
+            logger.info("Repo analysis cancelled for repo_id=%d", repo_id)
+            self._finish_task_log(task_log_id, "failed", stats, "用户取消")
+            _notify(
+                f"🛑 代码库分析已停止。"
+                f"已完成：{stats['files_parsed']} 个文件解析，{stats['knowledge_generated']} 条知识。"
+            )
 
         except Exception as e:
             logger.exception("Repo analysis failed for repo_id=%d", repo_id)
@@ -708,6 +730,7 @@ class RepoAnalyzer:
         repo_id: int,
         commit_hash: str,
         notify_fn: Any = None,
+        check_cancelled_fn: Any = None,
     ) -> tuple[list[dict[str, Any]], int]:
         """Generate knowledge for blocks via LLM.
 
@@ -753,6 +776,8 @@ class RepoAnalyzer:
                     "description": description,
                     "commit_hash": commit_hash,
                 }
+            except CancelledError:
+                raise
             except Exception as e:
                 logger.warning("Failed to generate knowledge for %s:%s: %s",
                                block.get("file_path"), block.get("block_name"), e)
@@ -765,6 +790,9 @@ class RepoAnalyzer:
             futures = {executor.submit(process_block, b): b for b in blocks}
             done_count = 0
             for future in as_completed(futures):
+                # Check cancellation before collecting each result
+                if check_cancelled_fn:
+                    check_cancelled_fn()
                 result = future.result()
                 if result:
                     entries.append(result)
@@ -850,6 +878,7 @@ class RepoAnalyzer:
         affected_dirs: set[str],
         repo_map: str,
         notify_fn: Any = None,
+        check_cancelled_fn: Any = None,
     ) -> int:
         """Regenerate module summaries for affected directories (concurrent).
 
@@ -922,6 +951,8 @@ class RepoAnalyzer:
             done_count = 0
             throttle = _ProgressThrottle(len(dirs_list))
             for future in as_completed(futures):
+                if check_cancelled_fn:
+                    check_cancelled_fn()
                 if future.result():
                     updated += 1
                 done_count += 1
