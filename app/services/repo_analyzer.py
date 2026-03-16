@@ -282,6 +282,9 @@ class RepoAnalyzer:
                 new_blocks.extend(blocks)
                 stats["files_parsed"] += 1
 
+            if total_files:
+                _notify("✅ 代码结构解析完成", progress=True)
+
             # ----------------------------------------------------------
             # Step 4: Upsert code_block records, detect what needs LLM
             # ----------------------------------------------------------
@@ -845,6 +848,9 @@ class RepoAnalyzer:
                     eta_part = f"，预计{eta}" if eta else ""
                     notify_fn(f"🤖 正在生成知识摘要（{pct}%{eta_part}）...", progress=True)
 
+        if notify_fn and total:
+            notify_fn("✅ 知识摘要生成完成", progress=True)
+
         return entries, failed
 
     def _store_block_knowledge(self, kb_id: int, entries: list[dict[str, Any]]) -> None:
@@ -1003,6 +1009,9 @@ class RepoAnalyzer:
                     eta = throttle.eta(done_count)
                     eta_part = f"，预计{eta}" if eta else ""
                     notify_fn(f"📝 正在更新模块摘要（{pct}%{eta_part}）...", progress=True)
+
+        if notify_fn and dirs_list:
+            notify_fn("✅ 模块摘要更新完成", progress=True)
 
         return updated
 
