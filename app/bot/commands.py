@@ -139,7 +139,7 @@ class CommandRouter:
             if not kb.milvus_collection:
                 kb.milvus_collection = f"kb_{kb.id}"
 
-        self.bot.send_message(chat_id, f"✅ 已将本群绑定到知识库「{kb_name}」，历史消息将被纳入知识库。")
+        self.bot.send_message(chat_id, f"✅ 已将本群绑定到知识库「{kb_name}」，正在拉取历史消息...")
 
         # Trigger async history fetch
         self._async_history_compensate(chat_id)
@@ -237,7 +237,7 @@ class CommandRouter:
             session.add(ChatRepoBinding(chat_id=chat_id, repo_id=repo.id))
             repo_id = repo.id
 
-        self.bot.send_message(chat_id, "✅ 已绑定代码库，正在分析代码库，请稍候...")
+        self.bot.send_message(chat_id, f"✅ 已绑定代码库「{git_url}」，正在克隆并分析代码，请稍候...")
 
         # Trigger async full analysis
         self._async_repo_analysis(repo_id, chat_id)
@@ -275,7 +275,7 @@ class CommandRouter:
 
             binding.deleted_at = datetime.utcnow()
 
-        self.bot.send_message(chat_id, "✅ 已解绑代码库。")
+        self.bot.send_message(chat_id, f"✅ 已解绑代码库「{git_url}」。")
 
     def _add_knowledge(self, chat_id: str, sender_id: str, content: str) -> None:
         if not content:
@@ -349,32 +349,45 @@ class CommandRouter:
             return
 
         with get_session() as session:
-            kb_ids = session.execute(
-                select(ChatKbBinding.kb_id).where(
+            # Get bound KBs with names
+            kbs = session.execute(
+                select(KnowledgeBase).join(
+                    ChatKbBinding, ChatKbBinding.kb_id == KnowledgeBase.id,
+                ).where(
                     ChatKbBinding.chat_id == chat_id,
                     ChatKbBinding.deleted_at.is_(None),
+                    KnowledgeBase.deleted_at.is_(None),
                 )
             ).scalars().all()
 
-            # Also get code repos
-            repo_ids = session.execute(
-                select(ChatRepoBinding.repo_id).where(
+            # Get bound repos with URLs
+            repos = session.execute(
+                select(CodeRepo).join(
+                    ChatRepoBinding, ChatRepoBinding.repo_id == CodeRepo.id,
+                ).where(
                     ChatRepoBinding.chat_id == chat_id,
                     ChatRepoBinding.deleted_at.is_(None),
+                    CodeRepo.deleted_at.is_(None),
                 )
             ).scalars().all()
 
-        if not kb_ids and not repo_ids:
+        if not kbs and not repos:
             self.bot.send_message(chat_id, "⚠️ 本群尚未绑定任何知识库或代码库。")
             return
 
-        total = len(set(kb_ids)) + len(set(repo_ids))
-        self.bot.send_message(chat_id, f"🔄 已触发知识库归纳任务，涉及 {total} 个知识库/代码库，请稍候...")
+        parts = []
+        if kbs:
+            names = "、".join(f"「{kb.name}」" for kb in kbs)
+            parts.append(f"知识库 {names}")
+        if repos:
+            urls = "、".join(f"「{r.git_url}」" for r in repos)
+            parts.append(f"代码库 {urls}")
+        self.bot.send_message(chat_id, f"🔄 正在归纳 {'，'.join(parts)}，请稍候...")
 
-        for kb_id in set(kb_ids):
-            self._async_summarize(kb_id)
-        for repo_id in set(repo_ids):
-            self._async_repo_analysis(repo_id, chat_id)
+        for kb in kbs:
+            self._async_summarize(kb.id)
+        for repo in repos:
+            self._async_repo_analysis(repo.id, chat_id)
 
     def _query_kb_status(self, chat_id: str, sender_id: str) -> None:
         if not self._is_admin(sender_id):
@@ -484,6 +497,7 @@ class CommandRouter:
     def _rag_query(self, chat_id: str, sender_id: str, question: str) -> None:
         if not question:
             return
+        self.bot.send_message(chat_id, "🔍 正在检索知识库...")
         answer = rag_service.answer(chat_id, question, sender_id=sender_id)
         self.bot.send_message(chat_id, answer)
 
