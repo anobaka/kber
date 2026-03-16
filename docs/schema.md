@@ -177,6 +177,17 @@ CREATE TABLE summarize_error_log (
 );
 ```
 
+### 2.12 群设置
+
+```sql
+CREATE TABLE chat_settings (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    chat_id VARCHAR(100) NOT NULL UNIQUE COMMENT '飞书 chat_id',
+    debug_mode BOOLEAN DEFAULT FALSE COMMENT '是否开启 Debug 模式',
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+```
+
 ## 3. Milvus Collection
 
 ### 3.1 知识库 Collection
@@ -229,4 +240,5 @@ knowledge_base (1) ←── (N) summarize_task_log
 knowledge_base (1) ←── (N) summarize_error_log
 code_repo      (1) ←── (N) code_block
 chat [飞书群]   (1) ←── (N) chat_message
+chat [飞书群]   (1) ←── (1) chat_settings
 ```

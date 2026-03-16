@@ -87,19 +87,21 @@ class RepoAnalyzer:
     def analyze_repo(
         self,
         repo_id: int,
-        chat_id: str | None = None,
-        progress_callback: Any = None,
+        notify_chat_ids: list[str] | None = None,
     ) -> dict[str, int]:
         """Full analysis of a code repository.
 
         Args:
             repo_id: Database ID of the code_repo record.
-            chat_id: For progress reporting.
-            progress_callback: Callable(chat_id, message) for progress updates.
+            notify_chat_ids: Explicit chat_ids to send progress to (e.g. from
+                a direct bind command).  Debug-enabled chats are always notified
+                in addition to these.
 
         Returns:
             Stats dict {files_parsed, blocks_found, knowledge_generated}.
         """
+        from app.services.debug_notifier import get_debug_chat_ids_for_repo, notify_repo
+
         stats = {"files_parsed": 0, "blocks_found": 0, "knowledge_generated": 0}
 
         with get_session() as session:
@@ -118,10 +120,22 @@ class RepoAnalyzer:
         repo_dir = os.path.join(config.REPOS_BASE_DIR, str(repo_id))
         task_log_id = self._start_task_log(kb_id, "code")
 
+        # Build unified notification helper: explicit targets + debug-enabled chats
+        def _notify(msg: str) -> None:
+            # Always notify debug-enabled chats
+            notify_repo(repo_id, msg)
+            # Also notify explicitly requested chats (e.g. from bind command)
+            if notify_chat_ids:
+                from app.services.debug_notifier import _send_fn
+                if _send_fn:
+                    debug_ids = set(get_debug_chat_ids_for_repo(repo_id))
+                    for cid in notify_chat_ids:
+                        if cid not in debug_ids:  # avoid duplicate
+                            _send_fn(cid, msg)
+
         try:
             # Step 1: Clone or pull
-            if progress_callback and chat_id:
-                progress_callback(chat_id, "📦 正在克隆仓库...")
+            _notify("📦 正在克隆仓库...")
 
             is_new = not os.path.exists(os.path.join(repo_dir, ".git"))
             if is_new:
@@ -138,14 +152,11 @@ class RepoAnalyzer:
                 changed_files = None  # Will process all files
 
             # Step 2: Scan and filter files
-            if progress_callback and chat_id:
-                progress_callback(chat_id, "🔍 正在解析代码结构...")
+            _notify("🔍 正在解析代码结构...")
 
             all_files = self._scan_files(repo_dir)
             if changed_files is not None:
-                # Filter to only changed/new files
                 files_to_process = [f for f in all_files if self._relative_path(f, repo_dir) in {c["path"] for c in changed_files if c["status"] in ("A", "M")}]
-                # Handle deleted files
                 deleted_paths = [c["path"] for c in changed_files if c["status"] == "D"]
                 self._delete_file_knowledge(kb_id, repo_id, deleted_paths)
             else:
@@ -156,8 +167,8 @@ class RepoAnalyzer:
             # Step 3: Parse files and extract code blocks
             all_blocks: list[dict[str, Any]] = []
             for i, fpath in enumerate(files_to_process):
-                if progress_callback and chat_id and (i + 1) % 10 == 0:
-                    progress_callback(chat_id, f"🔍 正在解析代码结构（已解析 {i + 1}/{total_files} 个文件）...")
+                if (i + 1) % 10 == 0:
+                    _notify(f"🔍 正在解析代码结构（已解析 {i + 1}/{total_files} 个文件）...")
 
                 blocks = self._parse_file(fpath, repo_dir, repo_id)
                 all_blocks.extend(blocks)
@@ -174,22 +185,18 @@ class RepoAnalyzer:
             repo_map = self._generate_repo_map(repo_dir, all_files)
 
             # Step 5: LLM knowledge generation
-            if progress_callback and chat_id:
-                progress_callback(chat_id, f"🤖 正在生成知识摘要（共 {len(all_blocks)} 个代码块）...")
+            _notify(f"🤖 正在生成知识摘要（共 {len(all_blocks)} 个代码块）...")
 
             knowledge_entries = self._generate_knowledge(
                 all_blocks, repo_map, kb_id, repo_id, current_commit,
-                chat_id=chat_id,
-                progress_callback=progress_callback,
+                notify_fn=_notify,
             )
             stats["knowledge_generated"] = len(knowledge_entries)
 
             # Step 6: Store in Milvus
-            if progress_callback and chat_id:
-                progress_callback(chat_id, "💾 正在写入向量数据库...")
+            _notify("💾 正在写入向量数据库...")
 
             if knowledge_entries:
-                # Delete old knowledge for modified files
                 if changed_files is not None:
                     modified_paths = [c["path"] for c in changed_files if c["status"] == "M"]
                     self._delete_file_knowledge(kb_id, repo_id, modified_paths)
@@ -200,22 +207,18 @@ class RepoAnalyzer:
             self._update_repo_commit(repo_id, current_commit)
             self._finish_task_log(task_log_id, "success", stats)
 
-            if progress_callback and chat_id:
-                progress_callback(
-                    chat_id,
-                    f"✅ 代码库分析完成！共解析 {stats['files_parsed']} 个文件，"
-                    f"生成 {stats['knowledge_generated']} 条知识。",
-                )
+            _notify(
+                f"✅ 代码库分析完成！共解析 {stats['files_parsed']} 个文件，"
+                f"生成 {stats['knowledge_generated']} 条知识。"
+            )
 
         except Exception as e:
             logger.exception("Repo analysis failed for repo_id=%d", repo_id)
             self._finish_task_log(task_log_id, "failed", stats, str(e))
-            if progress_callback and chat_id:
-                progress_callback(
-                    chat_id,
-                    f"⚠️ 代码库分析部分失败：{str(e)[:100]}，"
-                    f"已成功处理 {stats['files_parsed']}/{total_files} 个文件。",
-                )
+            _notify(
+                f"⚠️ 代码库分析部分失败：{str(e)[:100]}，"
+                f"已成功处理 {stats['files_parsed']}/{total_files} 个文件。"
+            )
 
         return stats
 
@@ -605,14 +608,12 @@ class RepoAnalyzer:
         kb_id: int,
         repo_id: int,
         commit_hash: str,
-        chat_id: str | None = None,
-        progress_callback: Any = None,
+        notify_fn: Any = None,
     ) -> list[dict[str, Any]]:
         """Generate knowledge descriptions for code blocks using LLM."""
         entries: list[dict[str, Any]] = []
         total = len(blocks)
 
-        # Process in batches with limited concurrency
         def process_block(idx: int, block: dict[str, Any]) -> dict[str, Any] | None:
             try:
                 description = llm_service.generate_code_knowledge(
@@ -621,12 +622,9 @@ class RepoAnalyzer:
                     block_type=block["block_type"],
                     block_name=block["block_name"] or "unknown",
                     language=block["language"],
-                    code=block["code"][:8000],  # Limit code length
+                    code=block["code"][:8000],
                 )
-
-                # Save code block record
                 self._save_code_block(block, commit_hash)
-
                 return {
                     "block": block,
                     "description": description,
@@ -648,11 +646,8 @@ class RepoAnalyzer:
                 if result:
                     entries.append(result)
                 done_count += 1
-                if progress_callback and chat_id and done_count % 20 == 0:
-                    progress_callback(
-                        chat_id,
-                        f"🤖 正在生成知识摘要（已完成 {done_count}/{total} 个代码块）...",
-                    )
+                if notify_fn and done_count % 20 == 0:
+                    notify_fn(f"🤖 正在生成知识摘要（已完成 {done_count}/{total} 个代码块）...")
 
         return entries
 

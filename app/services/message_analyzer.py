@@ -44,6 +44,11 @@ class MessageAnalyzer:
 
         Returns dict with counts: {new, updated, deleted, skipped}.
         """
+        from app.services.debug_notifier import notify_kb
+
+        def _dbg(msg: str) -> None:
+            notify_kb(kb_id, msg)
+
         task_log_id = self._start_task_log(kb_id, "scheduled")
         stats: dict[str, int] = {"new": 0, "updated": 0, "deleted": 0, "skipped": 0}
 
@@ -56,6 +61,8 @@ class MessageAnalyzer:
                 self._finish_task_log(task_log_id, "success", stats)
                 return stats
 
+            _dbg(f"开始归纳：{len(messages)} 条消息，{len(manual_entries)} 条手动知识")
+
             # Process manual knowledge immediately
             for mk in manual_entries:
                 mk_stats = self._process_manual_knowledge(kb_id, mk)
@@ -63,6 +70,7 @@ class MessageAnalyzer:
                     stats[k] += mk_stats.get(k, 0)
 
             if not messages:
+                _dbg(f"归纳完成：新增 {stats['new']} 条知识")
                 self._finish_task_log(task_log_id, "success", stats)
                 return stats
 
@@ -73,11 +81,14 @@ class MessageAnalyzer:
                 self._finish_task_log(task_log_id, "success", stats)
                 return stats
 
+            _dbg(f"过滤后 {len(meaningful)} 条有效消息，开始话题分组...")
+
             # Format messages for LLM
             messages_text = self._format_messages(meaningful)
 
             # Topic grouping
             topic_groups = self._group_topics(meaningful, messages_text)
+            _dbg(f"分为 {len(topic_groups)} 个话题组，开始逐组判定状态...")
 
             # Process each topic group
             processed_msg_ids: list[str] = []
@@ -96,10 +107,15 @@ class MessageAnalyzer:
                 self._mark_messages_processed(processed_msg_ids)
 
             self._finish_task_log(task_log_id, "success", stats)
+            _dbg(
+                f"归纳完成：新增 {stats['new']}，更新 {stats['updated']}，"
+                f"删除 {stats['deleted']}，跳过 {stats['skipped']}"
+            )
 
         except Exception as e:
             logger.exception("Summarization failed for kb_id=%d", kb_id)
             self._finish_task_log(task_log_id, "failed", stats, str(e))
+            _dbg(f"归纳失败：{str(e)[:200]}")
             raise
 
         return stats

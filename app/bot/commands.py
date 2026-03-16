@@ -13,6 +13,7 @@ from app.db.models import (
     ChatKbBinding,
     ChatMessage,
     ChatRepoBinding,
+    ChatSettings,
     CodeRepo,
     KnowledgeBase,
     ManualKnowledge,
@@ -54,6 +55,10 @@ class CommandRouter:
             self._force_summarize(chat_id, sender_id)
         elif text == "查询知识库":
             self._query_kb_status(chat_id, sender_id)
+        elif text == "enable-debug":
+            self._set_debug(chat_id, sender_id, True)
+        elif text == "disable-debug":
+            self._set_debug(chat_id, sender_id, False)
         elif text in ("帮助", "help"):
             self._show_help(chat_id)
         else:
@@ -389,6 +394,24 @@ class CommandRouter:
 
             self.bot.send_card(chat_id, "知识库状态", "\n\n".join(lines))
 
+    def _set_debug(self, chat_id: str, sender_id: str, enabled: bool) -> None:
+        if not self._is_admin(sender_id):
+            self.bot.send_message(chat_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
+            return
+
+        with get_session() as session:
+            settings = session.execute(
+                select(ChatSettings).where(ChatSettings.chat_id == chat_id)
+            ).scalar_one_or_none()
+
+            if settings:
+                settings.debug_mode = enabled
+            else:
+                session.add(ChatSettings(chat_id=chat_id, debug_mode=enabled))
+
+        status = "已开启" if enabled else "已关闭"
+        self.bot.send_message(chat_id, f"✅ 本群 Debug 模式{status}。")
+
     def _show_help(self, chat_id: str) -> None:
         help_text = """📖 **可用命令：**
 
@@ -402,6 +425,8 @@ class CommandRouter:
 🔒 **管理员命令：**
 **立即总结**　— 立即触发知识归纳任务
 **查询知识库**　— 查看所有知识库状态
+**enable-debug**　— 开启本群 Debug 模式（显示详细工作进度）
+**disable-debug**　— 关闭本群 Debug 模式
 
 💬 直接提问即可查询知识库，例如：「这个接口怎么调用？」"""
         self.bot.send_card(chat_id, "帮助", help_text)
@@ -462,11 +487,7 @@ class CommandRouter:
         def _run() -> None:
             try:
                 from app.services.repo_analyzer import repo_analyzer
-                repo_analyzer.analyze_repo(
-                    repo_id,
-                    chat_id=chat_id,
-                    progress_callback=lambda cid, msg: self.bot.send_message(cid, msg),
-                )
+                repo_analyzer.analyze_repo(repo_id, notify_chat_ids=[chat_id])
             except Exception:
                 logger.exception("Repo analysis failed for repo_id=%d", repo_id)
 

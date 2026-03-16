@@ -39,6 +39,10 @@ class FeishuBot:
     def start(self, message_handler: Any) -> None:
         """Start the WebSocket long connection to receive messages."""
         from app.bot.commands import CommandRouter
+        from app.services.debug_notifier import set_send_fn
+
+        # Register send function for debug notifications
+        set_send_fn(self.send_message)
 
         router = CommandRouter(self)
 

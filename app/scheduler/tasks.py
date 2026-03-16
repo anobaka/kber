@@ -111,6 +111,9 @@ def run_history_compensation() -> None:
 def compensate_history_for_chat(chat_id: str) -> None:
     """Fetch and store recent history messages for a specific chat."""
     from app.bot.handler import feishu_bot
+    from app.services.debug_notifier import notify_chat
+
+    notify_chat(chat_id, "开始拉取历史消息补偿...")
 
     messages = feishu_bot.fetch_history_messages(chat_id)
     if not messages:
@@ -144,6 +147,7 @@ def compensate_history_for_chat(chat_id: str) -> None:
 
     if stored:
         logger.info("Compensated %d messages for chat %s", stored, chat_id)
+        notify_chat(chat_id, f"历史消息补偿完成，新增 {stored} 条消息")
 
 
 # ------------------------------------------------------------------
@@ -161,6 +165,7 @@ def run_code_update_check() -> None:
 
     for repo in repos:
         try:
+            # check_and_update → analyze_repo, which uses notify_repo internally
             stats = repo_analyzer.check_and_update(repo.id)
             if stats.get("knowledge_generated", 0) > 0:
                 logger.info("Updated repo %d: %s", repo.id, stats)

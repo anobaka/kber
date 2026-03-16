@@ -110,6 +110,17 @@ class ManualKnowledge(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
 
 
+class ChatSettings(Base):
+    __tablename__ = "chat_settings"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    chat_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+    debug_mode: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow,
+    )
+
+
 class AdminUser(Base):
     __tablename__ = "admin_user"
 

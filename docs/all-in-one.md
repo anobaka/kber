@@ -167,6 +167,7 @@
 | `code_block` | analyze-repo | 代码块解析记录 |
 | `summarize_task_log` | analyze-messages | 归纳任务执行记录 |
 | `summarize_error_log` | analyze-messages | LLM 调用错误日志 |
+| `chat_settings` | channel | 群设置（Debug 模式等） |
 
 ## 8. 知识管理核心原则
 
