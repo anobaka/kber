@@ -137,7 +137,7 @@ class RepoAnalyzer:
 
             kb_id = repo.kb_id
             git_url = repo.git_url
-            branch = repo.default_branch or "main"
+            branch = repo.default_branch or ""
             last_commit = repo.last_commit_hash
 
         repo_dir = os.path.join(config.REPOS_BASE_DIR, str(repo_id))
@@ -274,20 +274,27 @@ class RepoAnalyzer:
         if not pat:
             return url
         if url.startswith("https://"):
-            return url.replace("https://", f"https://{pat}@", 1)
+            return url.replace("https://", f"https://oauth2:{pat}@", 1)
         if url.startswith("http://"):
-            return url.replace("http://", f"http://{pat}@", 1)
+            return url.replace("http://", f"http://oauth2:{pat}@", 1)
         return url
 
     def _git_clone(self, url: str, dest: str, branch: str) -> None:
         os.makedirs(dest, exist_ok=True)
         auth_url = self._build_clone_url(url)
-        subprocess.run(
-            ["git", "clone", "-b", branch, auth_url, dest],
-            check=True,
+        cmd = ["git", "clone", auth_url, dest]
+        if branch:
+            cmd = ["git", "clone", "-b", branch, auth_url, dest]
+        result = subprocess.run(
+            cmd,
             capture_output=True,
+            text=True,
             timeout=600,
         )
+        if result.returncode != 0:
+            # Redact PAT from error message
+            stderr = result.stderr.replace(config.GIT_PAT, "***") if config.GIT_PAT else result.stderr
+            raise RuntimeError(f"git clone failed (exit {result.returncode}): {stderr}")
         logger.info("Cloned %s to %s", url, dest)
 
     def _git_pull(self, repo_dir: str, branch: str) -> None:

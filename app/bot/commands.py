@@ -201,15 +201,22 @@ class CommandRouter:
             ).scalar_one_or_none()
 
             if not repo:
-                # Create a code-type knowledge base for this repo
-                repo_name = git_url.split("/")[-1]
-                kb = KnowledgeBase(
-                    name=repo_name,
-                    kb_type="code",
-                    description=f"Code knowledge from {git_url}",
-                )
-                session.add(kb)
-                session.flush()
+                # Create a code-type knowledge base for this repo (or reuse existing)
+                repo_name = git_url  # e.g. "fusion/crane"
+                kb = session.execute(
+                    select(KnowledgeBase).where(
+                        KnowledgeBase.name == repo_name,
+                        KnowledgeBase.deleted_at.is_(None),
+                    )
+                ).scalar_one_or_none()
+                if not kb:
+                    kb = KnowledgeBase(
+                        name=repo_name,
+                        kb_type="code",
+                        description=f"Code knowledge from {git_url}",
+                    )
+                    session.add(kb)
+                    session.flush()
 
                 milvus_service.ensure_collection(kb.id)
                 kb.milvus_collection = f"kb_{kb.id}"

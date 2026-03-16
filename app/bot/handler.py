@@ -48,7 +48,7 @@ class FeishuBot:
 
         event_handler = lark.EventDispatcherHandler.builder("", "") \
             .register_p2_im_message_receive_v1(
-                lambda ctx, event: self._on_message(ctx, event, router)
+                lambda event: self._on_message(None, event, router)
             ) \
             .build()
 
@@ -77,9 +77,7 @@ class FeishuBot:
 
             # Check if bot is mentioned (for group chats)
             mentions = msg.mentions or []
-            is_at_bot = any(
-                m.key in text for m in mentions if m.id and m.id.app_id == config.FEISHU_APP_ID
-            ) if mentions else False
+            is_at_bot = len(mentions) > 0
 
             # Remove @bot mention from text
             for m in mentions:

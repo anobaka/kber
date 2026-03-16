@@ -27,6 +27,8 @@ def main() -> None:
     from alembic.config import Config as AlembicConfig
     alembic_cfg = AlembicConfig("alembic.ini")
     command.upgrade(alembic_cfg, "head")
+    # Alembic's fileConfig resets root logger level to WARNING; restore it.
+    logging.getLogger().setLevel(logging.INFO)
 
     # Connect to Milvus
     logger.info("Connecting to Milvus...")

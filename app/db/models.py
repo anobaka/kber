@@ -52,7 +52,7 @@ class CodeRepo(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     git_url: Mapped[str] = mapped_column(String(500), nullable=False)
     kb_id: Mapped[Optional[int]] = mapped_column(BigInteger)
-    default_branch: Mapped[str] = mapped_column(String(100), default="main")
+    default_branch: Mapped[str] = mapped_column(String(100), default="")
     last_commit_hash: Mapped[Optional[str]] = mapped_column(String(64))
     last_analyzed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
