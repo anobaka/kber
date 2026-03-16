@@ -20,7 +20,7 @@
 - 增量更新：`git fetch origin` 获取最新代码，通过 `git diff {last_commit_hash}..origin/{branch} --name-status` 确定变更文件列表，再 `git pull` 合并
 - 克隆目录：`/data/repos/{repo_id}/`
 - 记录当前 `commit_hash` 到 `code_repo.last_commit_hash`
-- **私有仓库认证**：从应用配置中读取 SSH 私钥路径，通过 `GIT_SSH_COMMAND="ssh -i {ssh_key_path}"` 环境变量传递给 Git 命令。配置项：`GIT_SSH_KEY_PATH`
+- **私有仓库认证**：从应用配置中读取 Personal Access Token (PAT)，自动注入到 HTTPS URL 中（`https://{PAT}@github.com/...`）。配置项：`GIT_PAT`
 
 ### 3.2 文件过滤
 

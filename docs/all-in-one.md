@@ -222,7 +222,7 @@
 外部依赖：
 - 阿里云百炼 API（LLM + Embedding）
 - 飞书开放平台 API
-- Git 仓库（SSH/HTTPS 访问）
+- Git 仓库（HTTPS + PAT 访问）
 ```
 
 ## 11. 子文档索引
