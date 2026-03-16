@@ -84,7 +84,10 @@ LANG_MAP: dict[str, str] = {
 
 class _ProgressThrottle:
     """Throttle progress notifications: at most every *interval* seconds or
-    every *pct_step* percent of total, whichever comes first."""
+    every *pct_step* percent of total, whichever comes first.
+
+    Also tracks elapsed time to estimate remaining time via :meth:`eta`.
+    """
 
     def __init__(self, total: int, interval: float = 3.0, pct_step: int = 1) -> None:
         self._total = total
@@ -92,6 +95,7 @@ class _ProgressThrottle:
         self._pct_step = pct_step
         self._last_time = 0.0
         self._last_pct = -pct_step
+        self._start_time = time.monotonic()
 
     def should_notify(self, done: int) -> bool:
         if self._total <= 0:
@@ -103,6 +107,27 @@ class _ProgressThrottle:
             self._last_pct = pct
             return True
         return False
+
+    def eta(self, done: int) -> str:
+        """Return a human-readable ETA string like '约2分30秒'."""
+        if done <= 0 or self._total <= 0:
+            return ""
+        elapsed = time.monotonic() - self._start_time
+        remaining = elapsed / done * (self._total - done)
+        return _format_duration(remaining)
+
+
+def _format_duration(seconds: float) -> str:
+    """Format seconds into a human-readable Chinese duration string."""
+    s = int(seconds)
+    if s < 5:
+        return "即将完成"
+    if s < 60:
+        return f"约{s}秒"
+    m, s = divmod(s, 60)
+    if s == 0:
+        return f"约{m}分钟"
+    return f"约{m}分{s}秒"
 
 
 def _redact_sensitive(text: str) -> str:
@@ -250,7 +275,9 @@ class RepoAnalyzer:
                 if parse_throttle.should_notify(i + 1):
                     _check()
                     pct = (i + 1) * 100 // total_files
-                    _notify(f"🔍 正在解析代码结构（{pct}%，{i + 1}/{total_files} 个文件）...", progress=True)
+                    eta = parse_throttle.eta(i + 1)
+                    eta_part = f"，预计{eta}" if eta else ""
+                    _notify(f"🔍 正在解析代码结构（{pct}%，{i + 1}/{total_files} 个文件{eta_part}）...", progress=True)
                 blocks = self._parse_file(fpath, repo_dir, repo_id)
                 new_blocks.extend(blocks)
                 stats["files_parsed"] += 1
@@ -814,7 +841,9 @@ class RepoAnalyzer:
                 done_count += 1
                 if notify_fn and throttle.should_notify(done_count):
                     pct = done_count * 100 // total
-                    notify_fn(f"🤖 正在生成知识摘要（{pct}%，{done_count}/{total} 个代码块）...", progress=True)
+                    eta = throttle.eta(done_count)
+                    eta_part = f"，预计{eta}" if eta else ""
+                    notify_fn(f"🤖 正在生成知识摘要（{pct}%，{done_count}/{total} 个代码块{eta_part}）...", progress=True)
 
         return entries, failed
 
@@ -971,7 +1000,9 @@ class RepoAnalyzer:
                 done_count += 1
                 if notify_fn and throttle.should_notify(done_count):
                     pct = done_count * 100 // len(dirs_list)
-                    notify_fn(f"📝 正在更新模块摘要（{pct}%，{done_count}/{len(dirs_list)} 个模块）...", progress=True)
+                    eta = throttle.eta(done_count)
+                    eta_part = f"，预计{eta}" if eta else ""
+                    notify_fn(f"📝 正在更新模块摘要（{pct}%，{done_count}/{len(dirs_list)} 个模块{eta_part}）...", progress=True)
 
         return updated
 
