@@ -200,6 +200,10 @@ class RepoAnalyzer:
             branch = repo.default_branch or ""
             last_commit = repo.last_commit_hash
 
+        # Short repo label for progress messages (e.g. "fusion/crane")
+        _url = git_url.split(":")[-1] if ":" in git_url and "//" not in git_url.split(":")[0] else git_url
+        repo_label = "/".join(_url.rstrip("/").rsplit("/", 2)[-2:]).removesuffix(".git")
+
         def _check() -> None:
             if kb_id:
                 check_cancelled(kb_id)
@@ -211,6 +215,7 @@ class RepoAnalyzer:
         # progress=True → edit the previous progress card in-place.
         # done=True → final update for a phase (update card, then clear tracking).
         def _notify(msg: str, *, progress: bool = False, done: bool = False) -> None:
+            msg = f"【{repo_label}】{msg}"
             if not progress:
                 # Non-progress message: clear tracked card so next progress
                 # notification creates a fresh card.
