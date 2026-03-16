@@ -185,6 +185,10 @@ class RepoAnalyzer:
         # Unified notification helper.
         # progress=True → edit the previous progress message in-place.
         def _notify(msg: str, *, progress: bool = False) -> None:
+            if not progress:
+                # Phase change: clear tracked progress card so next progress
+                # notification creates a fresh card instead of editing the old one.
+                clear_progress_msg("repo", repo_id)
             notify_repo(repo_id, msg, progress=progress)
             if notify_chat_ids:
                 from app.services.debug_notifier import _send_fn, _send_or_update
