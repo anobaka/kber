@@ -71,6 +71,29 @@ LANG_MAP: dict[str, str] = {
 }
 
 
+class _ProgressThrottle:
+    """Throttle progress notifications: at most every ``interval`` seconds or
+    every ``pct_step`` percent of total, whichever comes first."""
+
+    def __init__(self, total: int, interval: float = 5.0, pct_step: int = 10) -> None:
+        self._total = total
+        self._interval = interval
+        self._pct_step = pct_step
+        self._last_time = 0.0
+        self._last_pct = -pct_step  # ensure first meaningful tick fires
+
+    def should_notify(self, done: int) -> bool:
+        if self._total <= 0:
+            return False
+        pct = done * 100 // self._total
+        now = time.monotonic()
+        if pct - self._last_pct >= self._pct_step or now - self._last_time >= self._interval:
+            self._last_time = now
+            self._last_pct = pct
+            return True
+        return False
+
+
 def _redact_sensitive(text: str) -> str:
     """Replace sensitive information with [REDACTED]."""
     for pattern in SENSITIVE_PATTERNS:
@@ -166,9 +189,11 @@ class RepoAnalyzer:
 
             # Step 3: Parse files and extract code blocks
             all_blocks: list[dict[str, Any]] = []
+            parse_throttle = _ProgressThrottle(total_files)
             for i, fpath in enumerate(files_to_process):
-                if (i + 1) % 10 == 0:
-                    _notify(f"🔍 正在解析代码结构（已解析 {i + 1}/{total_files} 个文件）...")
+                if parse_throttle.should_notify(i + 1):
+                    pct = (i + 1) * 100 // total_files
+                    _notify(f"🔍 正在解析代码结构（{pct}%，{i + 1}/{total_files} 个文件）...")
 
                 blocks = self._parse_file(fpath, repo_dir, repo_id)
                 all_blocks.extend(blocks)
@@ -641,13 +666,15 @@ class RepoAnalyzer:
                 for i, b in enumerate(blocks)
             }
             done_count = 0
+            gen_throttle = _ProgressThrottle(total)
             for future in as_completed(futures):
                 result = future.result()
                 if result:
                     entries.append(result)
                 done_count += 1
-                if notify_fn and done_count % 20 == 0:
-                    notify_fn(f"🤖 正在生成知识摘要（已完成 {done_count}/{total} 个代码块）...")
+                if notify_fn and gen_throttle.should_notify(done_count):
+                    pct = done_count * 100 // total
+                    notify_fn(f"🤖 正在生成知识摘要（{pct}%，{done_count}/{total} 个代码块）...")
 
         return entries
 
