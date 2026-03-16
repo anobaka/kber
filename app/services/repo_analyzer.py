@@ -851,15 +851,16 @@ class RepoAnalyzer:
         repo_map: str,
         notify_fn: Any = None,
     ) -> int:
-        """Regenerate module summaries for affected directories.
+        """Regenerate module summaries for affected directories (concurrent).
 
         Returns count of successfully updated modules.
         """
         updated = 0
+        dirs_list = sorted(affected_dirs)
 
-        for module_dir in affected_dirs:
+        def _process_module(module_dir: str) -> bool:
+            """Process a single module. Returns True on success."""
             try:
-                # Collect block-level descriptions for this module
                 with get_session() as session:
                     blocks = session.execute(
                         select(CodeBlock).where(
@@ -870,26 +871,22 @@ class RepoAnalyzer:
                     ).scalars().all()
 
                 if not blocks:
-                    # Module has no successful blocks – delete stale summary
                     try:
                         milvus_service.delete_by_expr(
                             kb_id, f'block_type == "module_summary" and file_path == "{module_dir}"',
                         )
                     except Exception:
                         pass
-                    continue
+                    return False
 
-                # Build a digest of block descriptions from Milvus
                 block_summaries = self._collect_block_descriptions(kb_id, module_dir, blocks)
 
-                # Call LLM
                 summary = llm_service.generate_module_summary(
                     repo_map=repo_map,
                     module_path=module_dir,
                     block_summaries=block_summaries,
                 )
 
-                # Delete old module summary in Milvus, then insert new one
                 try:
                     milvus_service.delete_by_expr(
                         kb_id, f'block_type == "module_summary" and file_path == "{module_dir}"',
@@ -914,11 +911,23 @@ class RepoAnalyzer:
                     "block_name": module_dir,
                     "commit_hash": "",
                 }])
-
-                updated += 1
+                return True
 
             except Exception as e:
                 logger.warning("Failed to generate module summary for %s: %s", module_dir, e)
+                return False
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {executor.submit(_process_module, d): d for d in dirs_list}
+            done_count = 0
+            throttle = _ProgressThrottle(len(dirs_list))
+            for future in as_completed(futures):
+                if future.result():
+                    updated += 1
+                done_count += 1
+                if notify_fn and throttle.should_notify(done_count):
+                    pct = done_count * 100 // len(dirs_list)
+                    notify_fn(f"📝 正在更新模块摘要（{pct}%，{done_count}/{len(dirs_list)} 个模块）...")
 
         return updated
 

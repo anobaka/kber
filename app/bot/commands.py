@@ -8,12 +8,15 @@ from typing import Any
 
 from sqlalchemy import func, select, update
 
+from sqlalchemy import delete as sa_delete
+
 from app.db.models import (
     AdminUser,
     ChatKbBinding,
     ChatMessage,
     ChatRepoBinding,
     ChatSettings,
+    CodeBlock,
     CodeRepo,
     KnowledgeBase,
     ManualKnowledge,
@@ -81,6 +84,8 @@ class CommandRouter:
             self._force_summarize(chat_id, sender_id)
         elif text == "查询知识库":
             self._query_kb_status(chat_id, sender_id)
+        elif text.startswith("重建知识库"):
+            self._rebuild_kb(chat_id, sender_id, text[len("重建知识库"):].strip())
         elif text == "enable-debug":
             self._set_debug(chat_id, sender_id, True)
         elif text == "disable-debug":
@@ -396,6 +401,80 @@ class CommandRouter:
         for repo in repos:
             self._async_repo_analysis(repo.id, chat_id)
 
+    def _rebuild_kb(self, chat_id: str, sender_id: str, kb_name: str) -> None:
+        if not self._is_admin(sender_id):
+            self.bot.send_message(chat_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
+            return
+
+        if not kb_name:
+            self.bot.send_message(chat_id, "⚠️ 请指定知识库名称，格式：重建知识库 {名称}")
+            return
+
+        with get_session() as session:
+            kb = session.execute(
+                select(KnowledgeBase).where(
+                    KnowledgeBase.name == kb_name,
+                    KnowledgeBase.deleted_at.is_(None),
+                )
+            ).scalar_one_or_none()
+
+            if not kb:
+                self.bot.send_message(chat_id, f"⚠️ 未找到知识库「{kb_name}」。")
+                return
+
+            kb_id = kb.id
+            kb_type = kb.kb_type
+
+            # For code KBs: clear code_block records and reset repo checkpoint
+            repo_id = None
+            if kb_type == "code":
+                repo = session.execute(
+                    select(CodeRepo).where(
+                        CodeRepo.kb_id == kb_id,
+                        CodeRepo.deleted_at.is_(None),
+                    )
+                ).scalar_one_or_none()
+                if repo:
+                    repo_id = repo.id
+                    session.execute(
+                        sa_delete(CodeBlock).where(CodeBlock.repo_id == repo_id)
+                    )
+                    repo.last_commit_hash = None
+                    repo.last_analyzed_at = None
+            else:
+                # For chat/manual KBs: reset processed flags
+                session.execute(
+                    update(ChatMessage).where(
+                        ChatMessage.chat_id.in_(
+                            select(ChatKbBinding.chat_id).where(
+                                ChatKbBinding.kb_id == kb_id,
+                                ChatKbBinding.deleted_at.is_(None),
+                            )
+                        ),
+                        ChatMessage.processed.is_(True),
+                    ).values(processed=False, topic_group_id=None)
+                )
+                session.execute(
+                    update(ManualKnowledge).where(
+                        ManualKnowledge.kb_id == kb_id,
+                        ManualKnowledge.processed.is_(True),
+                    ).values(processed=False)
+                )
+
+        # Clear Milvus collection
+        try:
+            milvus_service.drop_collection(kb_id)
+            milvus_service.ensure_collection(kb_id)
+        except Exception as e:
+            logger.warning("Failed to reset Milvus collection for kb_%d: %s", kb_id, e)
+
+        self.bot.send_message(chat_id, f"🔄 正在重建知识库「{kb_name}」（类型：{kb_type}），已清除旧数据...")
+
+        if kb_type == "code" and repo_id:
+            self._async_repo_analysis(repo_id, chat_id)
+        else:
+            self._async_summarize(kb_id)
+
     def _query_kb_status(self, chat_id: str, sender_id: str) -> None:
         if not self._is_admin(sender_id):
             self.bot.send_message(chat_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
@@ -494,6 +573,7 @@ class CommandRouter:
 
 🔒 **管理员命令：**
 **立即总结**　— 立即触发知识归纳任务
+**重建知识库** {名称}　— 清除并重建指定知识库
 **查询知识库**　— 查看所有知识库状态
 **enable-debug**　— 开启本群 Debug 模式（显示详细工作进度）
 **disable-debug**　— 关闭本群 Debug 模式
