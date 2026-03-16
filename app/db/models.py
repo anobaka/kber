@@ -153,7 +153,15 @@ class CodeBlock(Base):
     start_line: Mapped[Optional[int]] = mapped_column(Integer)
     end_line: Mapped[Optional[int]] = mapped_column(Integer)
     signature: Mapped[Optional[str]] = mapped_column(Text)
+    content_hash: Mapped[Optional[str]] = mapped_column(
+        String(64), comment="SHA-256 of code content, used to detect changes",
+    )
     commit_hash: Mapped[Optional[str]] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="pending",
+        comment="pending / success / failed",
+    )
+    error_message: Mapped[Optional[str]] = mapped_column(Text)
     milvus_id: Mapped[Optional[str]] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(
@@ -163,6 +171,7 @@ class CodeBlock(Base):
     __table_args__ = (
         Index("idx_repo_file", "repo_id", "file_path"),
         Index("idx_commit", "commit_hash"),
+        Index("idx_repo_status", "repo_id", "status"),
     )
 
 

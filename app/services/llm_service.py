@@ -184,6 +184,61 @@ class LLMService:
             {"role": "user", "content": prompt},
         ])
 
+    def generate_module_summary(self, repo_map: str, module_path: str, block_summaries: str) -> str:
+        """Generate a Chinese summary for a code module (directory)."""
+        prompt = f"""你是一个代码架构分析专家。请为以下代码模块生成一段中文的模块摘要。
+
+## 项目概览
+{repo_map}
+
+## 模块路径
+{module_path}
+
+## 该模块下的代码块描述
+{block_summaries}
+
+## 要求
+生成的摘要需要包含：
+1. 【模块职责】：该模块的核心职责（一句话概括）
+2. 【主要功能】：列出主要的类和函数及其作用（列表形式）
+3. 【对外接口】：该模块对外暴露的 API / 公共方法 / 入口函数
+4. 【依赖关系】：该模块依赖了哪些其他模块，被哪些模块依赖
+5. 【关键词】：便于中文检索的关键词（5-10个，覆盖业务术语和技术术语）
+
+注意：摘要要同时面向"中文检索"和"架构理解"优化，让不熟悉代码的人通过自然语言就能找到这个模块。
+"""
+        return self.chat([
+            {"role": "system", "content": "你是一个代码架构分析专家。"},
+            {"role": "user", "content": prompt},
+        ], max_tokens=2048)
+
+    def generate_repo_overview(self, repo_map: str, module_summaries: str) -> str:
+        """Generate a Chinese overview for the entire repository."""
+        prompt = f"""你是一个代码架构分析专家。请为以下代码仓库生成一份全局概览。
+
+## 项目结构
+{repo_map}
+
+## 各模块摘要
+{module_summaries}
+
+## 要求
+生成的概览需要包含：
+1. 【项目简介】：项目做了什么，解决什么问题（2-3句话）
+2. 【架构设计】：整体架构模式（如 MVC、微服务、分层架构等），各层职责
+3. 【核心模块】：列出所有主要模块及其一句话功能描述
+4. 【模块关系】：模块之间的调用关系和数据流（用文字描述，如"用户请求 → Controller → Service → Repository → DB"）
+5. 【API 清单】：列出对外暴露的主要 API / 命令 / 入口点
+6. 【技术栈】：使用的主要语言、框架、中间件
+7. 【关键词】：便于中文检索的关键词（10-20个，覆盖业务术语和技术术语）
+
+注意：概览要让完全不了解项目的人能快速理解项目全貌，同时便于中文自然语言检索。
+"""
+        return self.chat([
+            {"role": "system", "content": "你是一个代码架构分析专家。"},
+            {"role": "user", "content": prompt},
+        ], max_tokens=4096)
+
     def merge_knowledge(self, knowledge_a: str, knowledge_b: str) -> str:
         """Merge two similar knowledge entries into one."""
         prompt = f"""请将以下两条相似的知识合并为一条更精炼的知识：

@@ -1,13 +1,31 @@
-"""Code repository analysis – Git operations, AST parsing, and knowledge generation."""
+"""Code repository analysis – Git operations, AST parsing, and knowledge generation.
 
+Architecture:
+    Three levels of knowledge are generated for each repository:
+    1. **Block-level** – per function/class descriptions (existing)
+    2. **Module-level** – per directory summaries (new)
+    3. **Repo-level** – global architecture overview (new)
+
+    Block-level progress is tracked in the ``code_block`` table with a
+    ``status`` column (pending / success / failed).  Failed blocks are
+    automatically retried on the next run.  The ``content_hash`` column
+    detects actual code changes so unchanged blocks are skipped.
+
+    When blocks in a directory change, the module summary for that
+    directory is regenerated.  When any module summary changes, the
+    repo overview is regenerated.  This is *change-driven cascading
+    regeneration*.
+"""
+
+import hashlib
 import logging
 import os
 import re
 import subprocess
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 import pathspec
@@ -22,14 +40,16 @@ from app.services.milvus_service import milvus_service
 
 logger = logging.getLogger(__name__)
 
-# File extensions to process
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
 ALLOWED_EXTENSIONS = {
     ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs",
     ".cs", ".cpp", ".c", ".h", ".rb", ".php", ".swift", ".kt",
     ".scala", ".vue", ".sql", ".proto", ".graphql",
 }
 
-# Directories to always skip
 BLACKLIST_DIRS = {
     "node_modules", "vendor", "dist", "build", "target", ".git",
     "__pycache__", ".tox", ".nox", ".eggs", ".mypy_cache",
@@ -37,50 +57,40 @@ BLACKLIST_DIRS = {
 }
 
 MAX_FILE_SIZE = 100 * 1024  # 100KB
-MAX_LINE_LENGTH = 500  # Skip minified files
+MAX_LINE_LENGTH = 500
 
-# Sensitive info patterns
 SENSITIVE_PATTERNS = [
     re.compile(r"""(password|passwd|pwd)\s*[=:]\s*['"][^'"]+['"]""", re.IGNORECASE),
     re.compile(r"""(api_key|apikey|api-key)\s*[=:]\s*['"][^'"]+['"]""", re.IGNORECASE),
     re.compile(r"""(secret|secret_key)\s*[=:]\s*['"][^'"]+['"]""", re.IGNORECASE),
     re.compile(r"""(token|access_token|auth_token)\s*[=:]\s*['"][^'"]+['"]""", re.IGNORECASE),
     re.compile(r"""Bearer\s+[A-Za-z0-9\-._~+/]+=*""", re.IGNORECASE),
-    re.compile(r"""(AKIA|ABIA|ACCA|ASIA)[A-Z0-9]{16}"""),  # AWS key pattern
+    re.compile(r"""(AKIA|ABIA|ACCA|ASIA)[A-Z0-9]{16}"""),
 ]
 
-# Language map for tree-sitter
 LANG_MAP: dict[str, str] = {
-    ".py": "python",
-    ".js": "javascript",
-    ".jsx": "javascript",
-    ".ts": "typescript",
-    ".tsx": "typescript",
-    ".java": "java",
-    ".go": "go",
-    ".rs": "rust",
-    ".c": "c",
-    ".h": "c",
-    ".cpp": "cpp",
-    ".cs": "c_sharp",
-    ".rb": "ruby",
-    ".php": "php",
-    ".swift": "swift",
-    ".kt": "kotlin",
-    ".scala": "scala",
+    ".py": "python", ".js": "javascript", ".jsx": "javascript",
+    ".ts": "typescript", ".tsx": "typescript", ".java": "java",
+    ".go": "go", ".rs": "rust", ".c": "c", ".h": "c", ".cpp": "cpp",
+    ".cs": "c_sharp", ".rb": "ruby", ".php": "php",
+    ".swift": "swift", ".kt": "kotlin", ".scala": "scala",
 }
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
 class _ProgressThrottle:
-    """Throttle progress notifications: at most every ``interval`` seconds or
-    every ``pct_step`` percent of total, whichever comes first."""
+    """Throttle progress notifications: at most every *interval* seconds or
+    every *pct_step* percent of total, whichever comes first."""
 
     def __init__(self, total: int, interval: float = 5.0, pct_step: int = 10) -> None:
         self._total = total
         self._interval = interval
         self._pct_step = pct_step
         self._last_time = 0.0
-        self._last_pct = -pct_step  # ensure first meaningful tick fires
+        self._last_pct = -pct_step
 
     def should_notify(self, done: int) -> bool:
         if self._total <= 0:
@@ -95,17 +105,42 @@ class _ProgressThrottle:
 
 
 def _redact_sensitive(text: str) -> str:
-    """Replace sensitive information with [REDACTED]."""
     for pattern in SENSITIVE_PATTERNS:
         text = pattern.sub("[REDACTED]", text)
     return text
 
 
+def _content_hash(code: str) -> str:
+    """SHA-256 hex digest of code content."""
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+
+def _module_path(file_path: str) -> str:
+    """Derive the module (directory) key from a file path.
+
+    Uses up-to-2-level directory prefix so that ``app/services/foo.py``
+    maps to ``app/services``.  Top-level files map to ``"."``.
+    """
+    parts = file_path.replace("\\", "/").split("/")
+    if len(parts) <= 1:
+        return "."
+    return "/".join(parts[:2]) if len(parts) > 2 else parts[0]
+
+
+# ---------------------------------------------------------------------------
+# Main analyser
+# ---------------------------------------------------------------------------
+
+
 class RepoAnalyzer:
-    """Full pipeline for analyzing a code repository."""
+    """Full pipeline for analysing a code repository."""
 
     def __init__(self) -> None:
         self._ts_parsers: dict[str, Any] = {}
+
+    # ------------------------------------------------------------------ #
+    #  Public entry point                                                  #
+    # ------------------------------------------------------------------ #
 
     def analyze_repo(
         self,
@@ -114,18 +149,16 @@ class RepoAnalyzer:
     ) -> dict[str, int]:
         """Full analysis of a code repository.
 
-        Args:
-            repo_id: Database ID of the code_repo record.
-            notify_chat_ids: Explicit chat_ids to send progress to (e.g. from
-                a direct bind command).  Debug-enabled chats are always notified
-                in addition to these.
-
-        Returns:
-            Stats dict {files_parsed, blocks_found, knowledge_generated}.
+        Returns stats dict ``{files_parsed, blocks_found, blocks_success,
+        blocks_failed, knowledge_generated, modules_updated}``.
         """
         from app.services.debug_notifier import get_debug_chat_ids_for_repo, notify_repo
 
-        stats = {"files_parsed": 0, "blocks_found": 0, "knowledge_generated": 0}
+        stats: dict[str, int] = {
+            "files_parsed": 0, "blocks_found": 0, "blocks_success": 0,
+            "blocks_failed": 0, "knowledge_generated": 0,
+            "modules_updated": 0,
+        }
 
         with get_session() as session:
             repo = session.execute(
@@ -134,7 +167,6 @@ class RepoAnalyzer:
             if not repo:
                 logger.error("Code repo %d not found", repo_id)
                 return stats
-
             kb_id = repo.kb_id
             git_url = repo.git_url
             branch = repo.default_branch or ""
@@ -143,22 +175,23 @@ class RepoAnalyzer:
         repo_dir = os.path.join(config.REPOS_BASE_DIR, str(repo_id))
         task_log_id = self._start_task_log(kb_id, "code")
 
-        # Build unified notification helper: explicit targets + debug-enabled chats
+        # Unified notification helper
         def _notify(msg: str) -> None:
-            # Always notify debug-enabled chats
             notify_repo(repo_id, msg)
-            # Also notify explicitly requested chats (e.g. from bind command)
             if notify_chat_ids:
                 from app.services.debug_notifier import _send_fn
                 if _send_fn:
                     debug_ids = set(get_debug_chat_ids_for_repo(repo_id))
                     for cid in notify_chat_ids:
-                        if cid not in debug_ids:  # avoid duplicate
+                        if cid not in debug_ids:
                             _send_fn(cid, msg)
 
+        total_files = 0
         try:
-            # Step 1: Clone or pull
-            _notify("📦 正在克隆仓库...")
+            # ----------------------------------------------------------
+            # Step 1: Git clone / pull
+            # ----------------------------------------------------------
+            _notify("📦 正在同步代码仓库...")
 
             is_new = not os.path.exists(os.path.join(repo_dir, ".git"))
             if is_new:
@@ -168,18 +201,21 @@ class RepoAnalyzer:
 
             current_commit = self._get_current_commit(repo_dir)
 
-            # Determine changed files (or all files if first run)
+            # File-level diff (commit hash is only for *file-level* scope)
             if last_commit and not is_new:
                 changed_files = self._get_changed_files(repo_dir, last_commit, f"origin/{branch}")
             else:
-                changed_files = None  # Will process all files
+                changed_files = None  # all files
 
-            # Step 2: Scan and filter files
-            _notify("🔍 正在解析代码结构...")
+            # ----------------------------------------------------------
+            # Step 2: Scan & filter files
+            # ----------------------------------------------------------
+            _notify("🔍 正在扫描文件...")
 
             all_files = self._scan_files(repo_dir)
             if changed_files is not None:
-                files_to_process = [f for f in all_files if self._relative_path(f, repo_dir) in {c["path"] for c in changed_files if c["status"] in ("A", "M")}]
+                changed_set = {c["path"] for c in changed_files if c["status"] in ("A", "M")}
+                files_to_process = [f for f in all_files if self._relative_path(f, repo_dir) in changed_set]
                 deleted_paths = [c["path"] for c in changed_files if c["status"] == "D"]
                 self._delete_file_knowledge(kb_id, repo_id, deleted_paths)
             else:
@@ -187,89 +223,111 @@ class RepoAnalyzer:
 
             total_files = len(files_to_process)
 
-            # Step 3: Parse files and extract code blocks
-            all_blocks: list[dict[str, Any]] = []
+            # ----------------------------------------------------------
+            # Step 3: AST parse → code blocks
+            # ----------------------------------------------------------
+            new_blocks: list[dict[str, Any]] = []
             parse_throttle = _ProgressThrottle(total_files)
             for i, fpath in enumerate(files_to_process):
                 if parse_throttle.should_notify(i + 1):
                     pct = (i + 1) * 100 // total_files
                     _notify(f"🔍 正在解析代码结构（{pct}%，{i + 1}/{total_files} 个文件）...")
-
                 blocks = self._parse_file(fpath, repo_dir, repo_id)
-                all_blocks.extend(blocks)
+                new_blocks.extend(blocks)
                 stats["files_parsed"] += 1
 
-            stats["blocks_found"] = len(all_blocks)
+            # ----------------------------------------------------------
+            # Step 4: Upsert code_block records, detect what needs LLM
+            # ----------------------------------------------------------
+            blocks_to_generate = self._sync_code_blocks(
+                repo_id, new_blocks, current_commit, changed_files,
+            )
 
-            if not all_blocks:
-                self._update_repo_commit(repo_id, current_commit)
-                self._finish_task_log(task_log_id, "success", stats)
-                return stats
+            # Also pick up failed blocks from previous runs for retry
+            retry_blocks = self._load_failed_blocks(repo_id)
+            blocks_to_generate.extend(retry_blocks)
 
-            # Step 4: Generate repo map
+            stats["blocks_found"] = len(new_blocks) + len(retry_blocks)
+
+            # ----------------------------------------------------------
+            # Step 5: LLM knowledge generation (block level)
+            # ----------------------------------------------------------
             repo_map = self._generate_repo_map(repo_dir, all_files)
 
-            # Step 5: LLM knowledge generation
-            _notify(f"🤖 正在生成知识摘要（共 {len(all_blocks)} 个代码块）...")
+            if blocks_to_generate:
+                _notify(f"🤖 正在生成知识摘要（共 {len(blocks_to_generate)} 个代码块）...")
 
-            knowledge_entries = self._generate_knowledge(
-                all_blocks, repo_map, kb_id, repo_id, current_commit,
-                notify_fn=_notify,
-            )
-            stats["knowledge_generated"] = len(knowledge_entries)
+                success_entries, failed_count = self._generate_block_knowledge(
+                    blocks_to_generate, repo_map, kb_id, repo_id, current_commit,
+                    notify_fn=_notify,
+                )
+                stats["blocks_success"] = len(success_entries)
+                stats["blocks_failed"] = failed_count
+                stats["knowledge_generated"] = len(success_entries)
 
-            # Step 6: Store in Milvus
-            _notify("💾 正在写入向量数据库...")
+                # Write successful entries to Milvus
+                if success_entries:
+                    _notify("💾 正在写入代码块知识...")
+                    self._store_block_knowledge(kb_id, success_entries)
 
-            if knowledge_entries:
-                if changed_files is not None:
-                    modified_paths = [c["path"] for c in changed_files if c["status"] == "M"]
-                    self._delete_file_knowledge(kb_id, repo_id, modified_paths)
-
-                self._store_knowledge(kb_id, knowledge_entries)
-
-            # Update repo commit hash
+            # Always advance commit hash (file-level checkpoint)
             self._update_repo_commit(repo_id, current_commit)
+
+            # ----------------------------------------------------------
+            # Step 6: Module summaries (cascading)
+            # ----------------------------------------------------------
+            affected_dirs = self._get_affected_modules(
+                repo_id, blocks_to_generate, changed_files,
+            )
+            if affected_dirs:
+                _notify(f"📝 正在更新 {len(affected_dirs)} 个模块摘要...")
+                updated = self._regenerate_module_summaries(
+                    kb_id, repo_id, affected_dirs, repo_map, _notify,
+                )
+                stats["modules_updated"] = updated
+
+            # ----------------------------------------------------------
+            # Step 7: Repo overview (regenerate if anything changed)
+            # ----------------------------------------------------------
+            if blocks_to_generate or affected_dirs:
+                _notify("📋 正在更新仓库概览...")
+                self._regenerate_repo_overview(kb_id, repo_id, repo_map)
+
             self._finish_task_log(task_log_id, "success", stats)
 
-            _notify(
-                f"✅ 代码库分析完成！共解析 {stats['files_parsed']} 个文件，"
-                f"生成 {stats['knowledge_generated']} 条知识。"
-            )
+            summary_parts = [
+                f"共解析 {stats['files_parsed']} 个文件",
+                f"生成 {stats['knowledge_generated']} 条代码知识",
+            ]
+            if stats["blocks_failed"]:
+                summary_parts.append(f"{stats['blocks_failed']} 个代码块失败（将在下次重试）")
+            if stats["modules_updated"]:
+                summary_parts.append(f"更新 {stats['modules_updated']} 个模块摘要")
+            _notify(f"✅ 代码库分析完成！{'，'.join(summary_parts)}。")
 
         except Exception as e:
             logger.exception("Repo analysis failed for repo_id=%d", repo_id)
             self._finish_task_log(task_log_id, "failed", stats, str(e))
             _notify(
-                f"⚠️ 代码库分析部分失败：{str(e)[:100]}，"
+                f"⚠️ 代码库分析失败：{str(e)[:100]}，"
                 f"已成功处理 {stats['files_parsed']}/{total_files} 个文件。"
             )
 
         return stats
 
     def check_and_update(self, repo_id: int) -> dict[str, int]:
-        """Check for remote updates and run incremental analysis."""
         return self.analyze_repo(repo_id)
 
-    # ------------------------------------------------------------------
-    # Git operations
-    # ------------------------------------------------------------------
+    # ================================================================== #
+    #  Git operations                                                      #
+    # ================================================================== #
 
     @staticmethod
     def _build_clone_url(repo_path: str) -> str:
-        """Build a full authenticated clone URL.
-
-        repo_path is either a full URL or a short path like ``org/repo``.
-        When GIT_BASE_URL is configured, short paths are expanded to
-        ``{GIT_BASE_URL}/{repo_path}.git``.  The PAT is injected into
-        the HTTPS URL for authentication.
-        """
         url = repo_path
-        # Expand short path → full URL
         if not url.startswith("http://") and not url.startswith("https://"):
             base = config.GIT_BASE_URL.rstrip("/")
             url = f"{base}/{url.strip('/')}.git"
-
         pat = config.GIT_PAT
         if not pat:
             return url
@@ -286,13 +344,9 @@ class RepoAnalyzer:
         if branch:
             cmd = ["git", "clone", "-b", branch, auth_url, dest]
         result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=600,
+            cmd, capture_output=True, text=True, timeout=600,
         )
         if result.returncode != 0:
-            # Redact PAT from error message
             stderr = result.stderr.replace(config.GIT_PAT, "***") if config.GIT_PAT else result.stderr
             raise RuntimeError(f"git clone failed (exit {result.returncode}): {stderr}")
         logger.info("Cloned %s to %s", url, dest)
@@ -300,34 +354,24 @@ class RepoAnalyzer:
     def _git_pull(self, repo_dir: str, branch: str) -> None:
         subprocess.run(
             ["git", "fetch", "origin"],
-            cwd=repo_dir,
-            check=True,
-            capture_output=True,
-            timeout=300,
+            cwd=repo_dir, check=True, capture_output=True, timeout=300,
         )
         subprocess.run(
             ["git", "pull", "origin", branch],
-            cwd=repo_dir,
-            check=True,
-            capture_output=True,
-            timeout=300,
+            cwd=repo_dir, check=True, capture_output=True, timeout=300,
         )
 
     def _get_current_commit(self, repo_dir: str) -> str:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
-            cwd=repo_dir,
-            capture_output=True,
-            text=True,
+            cwd=repo_dir, capture_output=True, text=True,
         )
         return result.stdout.strip()
 
     def _get_changed_files(self, repo_dir: str, from_commit: str, to_ref: str) -> list[dict[str, str]]:
         result = subprocess.run(
             ["git", "diff", f"{from_commit}..{to_ref}", "--name-status"],
-            cwd=repo_dir,
-            capture_output=True,
-            text=True,
+            cwd=repo_dir, capture_output=True, text=True,
         )
         changes: list[dict[str, str]] = []
         for line in result.stdout.strip().split("\n"):
@@ -338,13 +382,11 @@ class RepoAnalyzer:
                 changes.append({"status": parts[0][0], "path": parts[-1]})
         return changes
 
-    # ------------------------------------------------------------------
-    # File scanning and filtering
-    # ------------------------------------------------------------------
+    # ================================================================== #
+    #  File scanning                                                       #
+    # ================================================================== #
 
     def _scan_files(self, repo_dir: str) -> list[str]:
-        """Scan repository for processable files."""
-        # Load .gitignore
         gitignore_path = os.path.join(repo_dir, ".gitignore")
         spec = None
         if os.path.exists(gitignore_path):
@@ -353,30 +395,20 @@ class RepoAnalyzer:
 
         result: list[str] = []
         for root, dirs, files in os.walk(repo_dir):
-            # Skip blacklisted directories
             dirs[:] = [d for d in dirs if d not in BLACKLIST_DIRS]
-
             for fname in files:
                 fpath = os.path.join(root, fname)
                 rel_path = os.path.relpath(fpath, repo_dir)
-
-                # Extension check
                 ext = os.path.splitext(fname)[1].lower()
                 if ext not in ALLOWED_EXTENSIONS:
                     continue
-
-                # Gitignore check
                 if spec and spec.match_file(rel_path):
                     continue
-
-                # Size check
                 try:
                     if os.path.getsize(fpath) > MAX_FILE_SIZE:
                         continue
                 except OSError:
                     continue
-
-                # Minified check
                 try:
                     with open(fpath, "r", errors="ignore") as f:
                         first_line = f.readline()
@@ -384,240 +416,276 @@ class RepoAnalyzer:
                             continue
                 except Exception:
                     continue
-
                 result.append(fpath)
-
         return result
 
     def _relative_path(self, fpath: str, repo_dir: str) -> str:
         return os.path.relpath(fpath, repo_dir)
 
-    # ------------------------------------------------------------------
-    # AST parsing
-    # ------------------------------------------------------------------
+    # ================================================================== #
+    #  AST parsing                                                         #
+    # ================================================================== #
 
     def _parse_file(self, fpath: str, repo_dir: str, repo_id: int) -> list[dict[str, Any]]:
-        """Parse a file into code blocks using tree-sitter."""
         ext = os.path.splitext(fpath)[1].lower()
         lang = LANG_MAP.get(ext)
         rel_path = self._relative_path(fpath, repo_dir)
-
         try:
             with open(fpath, "r", errors="ignore") as f:
                 source = f.read()
         except Exception:
             return []
-
         source = _redact_sensitive(source)
-
         if lang:
             blocks = self._parse_with_treesitter(source, lang, rel_path, repo_id)
             if blocks:
                 return blocks
-
-        # Fallback: treat the whole file as one block
         return self._fallback_parse(source, rel_path, repo_id, ext)
 
-    def _parse_with_treesitter(
-        self, source: str, lang: str, rel_path: str, repo_id: int,
-    ) -> list[dict[str, Any]]:
-        """Extract code blocks using tree-sitter AST."""
+    def _parse_with_treesitter(self, source: str, lang: str, rel_path: str, repo_id: int) -> list[dict[str, Any]]:
         try:
             import tree_sitter
-
-            parser_key = lang
-            if parser_key not in self._ts_parsers:
+            if lang not in self._ts_parsers:
                 ts_lang = self._load_ts_language(lang)
                 if ts_lang is None:
                     return []
-                parser = tree_sitter.Parser(ts_lang)
-                self._ts_parsers[parser_key] = parser
-            else:
-                parser = self._ts_parsers[parser_key]
-
+                self._ts_parsers[lang] = tree_sitter.Parser(ts_lang)
+            parser = self._ts_parsers[lang]
             tree = parser.parse(source.encode("utf-8"))
             blocks: list[dict[str, Any]] = []
-
             self._extract_blocks(tree.root_node, source, rel_path, repo_id, lang, blocks, parent_class=None)
             return blocks
-
         except Exception as e:
             logger.debug("Tree-sitter parse failed for %s: %s", rel_path, e)
             return []
 
     def _load_ts_language(self, lang: str) -> Any:
-        """Load tree-sitter language module."""
         try:
             if lang == "python":
-                import tree_sitter_python
-                return tree_sitter_python.language()
+                import tree_sitter_python; return tree_sitter_python.language()
             elif lang == "javascript":
-                import tree_sitter_javascript
-                return tree_sitter_javascript.language()
+                import tree_sitter_javascript; return tree_sitter_javascript.language()
             elif lang == "typescript":
-                import tree_sitter_typescript
-                return tree_sitter_typescript.language_typescript()
+                import tree_sitter_typescript; return tree_sitter_typescript.language_typescript()
             elif lang == "java":
-                import tree_sitter_java
-                return tree_sitter_java.language()
+                import tree_sitter_java; return tree_sitter_java.language()
             elif lang == "go":
-                import tree_sitter_go
-                return tree_sitter_go.language()
+                import tree_sitter_go; return tree_sitter_go.language()
             elif lang == "rust":
-                import tree_sitter_rust
-                return tree_sitter_rust.language()
+                import tree_sitter_rust; return tree_sitter_rust.language()
             elif lang == "c":
-                import tree_sitter_c
-                return tree_sitter_c.language()
+                import tree_sitter_c; return tree_sitter_c.language()
             elif lang == "cpp":
-                import tree_sitter_cpp
-                return tree_sitter_cpp.language()
-            else:
-                return None
+                import tree_sitter_cpp; return tree_sitter_cpp.language()
+            return None
         except ImportError:
             logger.debug("tree-sitter language %s not installed", lang)
             return None
 
-    def _extract_blocks(
-        self,
-        node: Any,
-        source: str,
-        rel_path: str,
-        repo_id: int,
-        lang: str,
-        blocks: list[dict[str, Any]],
-        parent_class: str | None,
-    ) -> None:
-        """Recursively extract code blocks from AST."""
-        # Node types that represent meaningful code blocks
-        class_types = {
-            "class_definition", "class_declaration", "class_specifier",
-            "struct_item", "struct_declaration", "interface_declaration",
-            "type_declaration", "enum_declaration",
-        }
-        func_types = {
-            "function_definition", "function_declaration", "method_definition",
-            "method_declaration", "function_item", "arrow_function",
-        }
-        const_types = {
-            "const_declaration", "variable_declaration", "assignment",
-            "const_item", "static_item",
-        }
+    def _extract_blocks(self, node: Any, source: str, rel_path: str, repo_id: int, lang: str, blocks: list[dict[str, Any]], parent_class: str | None) -> None:
+        class_types = {"class_definition", "class_declaration", "class_specifier", "struct_item", "struct_declaration", "interface_declaration", "type_declaration", "enum_declaration"}
+        func_types = {"function_definition", "function_declaration", "method_definition", "method_declaration", "function_item", "arrow_function"}
 
         node_type = node.type
-
         if node_type in class_types:
             name = self._get_node_name(node)
-            start_line = node.start_point[0] + 1
-            end_line = node.end_point[0] + 1
             code = source[node.start_byte:node.end_byte]
-            signature = self._extract_signature(code)
-
             blocks.append({
-                "file_path": rel_path,
-                "language": lang,
-                "block_type": "class",
-                "block_name": name,
-                "parent_class": parent_class,
-                "start_line": start_line,
-                "end_line": end_line,
-                "signature": signature,
-                "code": code,
-                "repo_id": repo_id,
+                "file_path": rel_path, "language": lang, "block_type": "class",
+                "block_name": name, "parent_class": parent_class,
+                "start_line": node.start_point[0] + 1, "end_line": node.end_point[0] + 1,
+                "signature": self._extract_signature(code), "code": code, "repo_id": repo_id,
             })
-
-            # Recurse into class body for methods
             for child in node.children:
                 self._extract_blocks(child, source, rel_path, repo_id, lang, blocks, parent_class=name)
             return
 
         if node_type in func_types:
             name = self._get_node_name(node)
-            start_line = node.start_point[0] + 1
-            end_line = node.end_point[0] + 1
             code = source[node.start_byte:node.end_byte]
-            signature = self._extract_signature(code)
-
-            block_type = "method" if parent_class else "function"
             blocks.append({
-                "file_path": rel_path,
-                "language": lang,
-                "block_type": block_type,
-                "block_name": name,
-                "parent_class": parent_class,
-                "start_line": start_line,
-                "end_line": end_line,
-                "signature": signature,
-                "code": code,
-                "repo_id": repo_id,
+                "file_path": rel_path, "language": lang,
+                "block_type": "method" if parent_class else "function",
+                "block_name": name, "parent_class": parent_class,
+                "start_line": node.start_point[0] + 1, "end_line": node.end_point[0] + 1,
+                "signature": self._extract_signature(code), "code": code, "repo_id": repo_id,
             })
             return
 
-        # Recurse into children
         for child in node.children:
             self._extract_blocks(child, source, rel_path, repo_id, lang, blocks, parent_class=parent_class)
 
     def _get_node_name(self, node: Any) -> str:
-        """Extract the name identifier from an AST node."""
         for child in node.children:
             if child.type in ("identifier", "name", "type_identifier", "property_identifier"):
                 return child.text.decode("utf-8") if isinstance(child.text, bytes) else child.text
         return "anonymous"
 
     def _extract_signature(self, code: str) -> str:
-        """Extract the first line (signature) of a code block."""
-        lines = code.split("\n")
-        for line in lines:
-            stripped = line.strip()
-            if stripped and not stripped.startswith("#") and not stripped.startswith("//"):
-                return stripped[:500]
+        for line in code.split("\n"):
+            s = line.strip()
+            if s and not s.startswith("#") and not s.startswith("//"):
+                return s[:500]
         return ""
 
     def _fallback_parse(self, source: str, rel_path: str, repo_id: int, ext: str) -> list[dict[str, Any]]:
-        """Fallback: split file into chunks if tree-sitter isn't available."""
         lang = LANG_MAP.get(ext, ext.lstrip("."))
         lines = source.split("\n")
         if len(lines) <= 100:
             return [{
-                "file_path": rel_path,
-                "language": lang,
-                "block_type": "file",
-                "block_name": os.path.basename(rel_path),
-                "parent_class": None,
-                "start_line": 1,
-                "end_line": len(lines),
-                "signature": "",
-                "code": source,
-                "repo_id": repo_id,
+                "file_path": rel_path, "language": lang, "block_type": "file",
+                "block_name": os.path.basename(rel_path), "parent_class": None,
+                "start_line": 1, "end_line": len(lines), "signature": "",
+                "code": source, "repo_id": repo_id,
             }]
-
-        # Split into ~80-line chunks
         blocks: list[dict[str, Any]] = []
         chunk_size = 80
         for i in range(0, len(lines), chunk_size):
             chunk = "\n".join(lines[i:i + chunk_size])
             blocks.append({
-                "file_path": rel_path,
-                "language": lang,
-                "block_type": "chunk",
-                "block_name": f"{os.path.basename(rel_path)}:{i + 1}",
-                "parent_class": None,
-                "start_line": i + 1,
-                "end_line": min(i + chunk_size, len(lines)),
-                "signature": "",
-                "code": chunk,
-                "repo_id": repo_id,
+                "file_path": rel_path, "language": lang, "block_type": "chunk",
+                "block_name": f"{os.path.basename(rel_path)}:{i + 1}", "parent_class": None,
+                "start_line": i + 1, "end_line": min(i + chunk_size, len(lines)),
+                "signature": "", "code": chunk, "repo_id": repo_id,
             })
         return blocks
 
-    # ------------------------------------------------------------------
-    # Knowledge generation
-    # ------------------------------------------------------------------
+    # ================================================================== #
+    #  Block-level tracking (code_block table)                             #
+    # ================================================================== #
+
+    def _sync_code_blocks(
+        self,
+        repo_id: int,
+        new_blocks: list[dict[str, Any]],
+        commit_hash: str,
+        changed_files: list[dict[str, str]] | None,
+    ) -> list[dict[str, Any]]:
+        """Sync parsed blocks with ``code_block`` table.
+
+        For each parsed block, compute a ``content_hash``.  If a matching
+        record already exists with the same hash and ``status=success``,
+        skip it (no change).  Otherwise upsert as ``pending`` so it will
+        be sent to LLM.
+
+        Returns the list of block dicts that need LLM generation.
+        """
+        blocks_needing_llm: list[dict[str, Any]] = []
+
+        with get_session() as session:
+            # Load existing blocks for this repo (keyed by file:name:start)
+            existing_rows = session.execute(
+                select(CodeBlock).where(CodeBlock.repo_id == repo_id)
+            ).scalars().all()
+            existing_map: dict[str, CodeBlock] = {}
+            for row in existing_rows:
+                key = f"{row.file_path}:{row.block_name}:{row.start_line}"
+                existing_map[key] = row
+
+            # If files were deleted, clean up their code_block records
+            if changed_files:
+                deleted_paths = {c["path"] for c in changed_files if c["status"] == "D"}
+                if deleted_paths:
+                    session.execute(
+                        delete(CodeBlock).where(
+                            CodeBlock.repo_id == repo_id,
+                            CodeBlock.file_path.in_(deleted_paths),
+                        )
+                    )
+
+            for block in new_blocks:
+                key = f"{block['file_path']}:{block.get('block_name', '')}:{block.get('start_line', 0)}"
+                chash = _content_hash(block.get("code", ""))
+
+                existing = existing_map.get(key)
+                if existing and existing.content_hash == chash and existing.status == "success":
+                    # Code hasn't changed and was successfully processed → skip
+                    continue
+
+                if existing:
+                    # Code changed or previous attempt failed → reset to pending
+                    existing.content_hash = chash
+                    existing.commit_hash = commit_hash
+                    existing.start_line = block.get("start_line")
+                    existing.end_line = block.get("end_line")
+                    existing.signature = block.get("signature")
+                    existing.status = "pending"
+                    existing.error_message = None
+                    block["_cb_id"] = existing.id
+                else:
+                    # New block
+                    cb = CodeBlock(
+                        repo_id=repo_id,
+                        file_path=block["file_path"],
+                        block_type=block["block_type"],
+                        block_name=block.get("block_name"),
+                        parent_class=block.get("parent_class"),
+                        start_line=block.get("start_line"),
+                        end_line=block.get("end_line"),
+                        signature=block.get("signature"),
+                        content_hash=chash,
+                        commit_hash=commit_hash,
+                        status="pending",
+                    )
+                    session.add(cb)
+                    session.flush()
+                    block["_cb_id"] = cb.id
+
+                blocks_needing_llm.append(block)
+
+        return blocks_needing_llm
+
+    def _load_failed_blocks(self, repo_id: int) -> list[dict[str, Any]]:
+        """Load previously failed blocks for retry."""
+        with get_session() as session:
+            rows = session.execute(
+                select(CodeBlock).where(
+                    CodeBlock.repo_id == repo_id,
+                    CodeBlock.status == "failed",
+                )
+            ).scalars().all()
+
+            blocks: list[dict[str, Any]] = []
+            for row in rows:
+                blocks.append({
+                    "file_path": row.file_path,
+                    "language": LANG_MAP.get(os.path.splitext(row.file_path)[1].lower(), ""),
+                    "block_type": row.block_type,
+                    "block_name": row.block_name,
+                    "parent_class": row.parent_class,
+                    "start_line": row.start_line,
+                    "end_line": row.end_line,
+                    "signature": row.signature or "",
+                    "code": "",  # Code needs to be re-read from file
+                    "repo_id": repo_id,
+                    "_cb_id": row.id,
+                    "_is_retry": True,
+                })
+            return blocks
+
+    def _mark_block_success(self, cb_id: int, milvus_id: str | None = None) -> None:
+        with get_session() as session:
+            session.execute(
+                update(CodeBlock).where(CodeBlock.id == cb_id).values(
+                    status="success", error_message=None, milvus_id=milvus_id,
+                )
+            )
+
+    def _mark_block_failed(self, cb_id: int, error: str) -> None:
+        with get_session() as session:
+            session.execute(
+                update(CodeBlock).where(CodeBlock.id == cb_id).values(
+                    status="failed", error_message=error[:500],
+                )
+            )
+
+    # ================================================================== #
+    #  Block-level knowledge generation                                    #
+    # ================================================================== #
 
     def _generate_repo_map(self, repo_dir: str, files: list[str]) -> str:
-        """Generate a lightweight repo structure overview."""
         tree: dict[str, list[str]] = {}
-        for fpath in files[:200]:  # Limit to avoid huge maps
+        for fpath in files[:200]:
             rel = self._relative_path(fpath, repo_dir)
             parts = rel.split(os.sep)
             dir_path = "/".join(parts[:-1]) or "."
@@ -630,10 +698,9 @@ class RepoAnalyzer:
                 lines.append(f"    {fname}")
             if len(tree[dir_path]) > 20:
                 lines.append(f"    ... 还有 {len(tree[dir_path]) - 20} 个文件")
-
         return "\n".join(lines[:100])
 
-    def _generate_knowledge(
+    def _generate_block_knowledge(
         self,
         blocks: list[dict[str, Any]],
         repo_map: str,
@@ -641,22 +708,46 @@ class RepoAnalyzer:
         repo_id: int,
         commit_hash: str,
         notify_fn: Any = None,
-    ) -> list[dict[str, Any]]:
-        """Generate knowledge descriptions for code blocks using LLM."""
-        entries: list[dict[str, Any]] = []
-        total = len(blocks)
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Generate knowledge for blocks via LLM.
 
-        def process_block(idx: int, block: dict[str, Any]) -> dict[str, Any] | None:
+        Returns ``(success_entries, failed_count)``.
+        """
+        entries: list[dict[str, Any]] = []
+        failed = 0
+        total = len(blocks)
+        repo_dir = os.path.join(config.REPOS_BASE_DIR, str(repo_id))
+
+        def process_block(block: dict[str, Any]) -> dict[str, Any] | None:
+            cb_id = block.get("_cb_id")
             try:
+                # For retry blocks, re-read code from file
+                code = block.get("code", "")
+                if not code and block.get("_is_retry"):
+                    fpath = os.path.join(repo_dir, block["file_path"])
+                    if os.path.exists(fpath):
+                        with open(fpath, "r", errors="ignore") as f:
+                            source = f.read()
+                        source = _redact_sensitive(source)
+                        start = (block.get("start_line") or 1) - 1
+                        end = block.get("end_line") or len(source.split("\n"))
+                        code = "\n".join(source.split("\n")[start:end])
+
+                if not code:
+                    raise ValueError("Empty code block")
+
                 description = llm_service.generate_code_knowledge(
                     repo_map=repo_map,
                     file_path=block["file_path"],
                     block_type=block["block_type"],
-                    block_name=block["block_name"] or "unknown",
-                    language=block["language"],
-                    code=block["code"][:8000],
+                    block_name=block.get("block_name") or "unknown",
+                    language=block.get("language", ""),
+                    code=code[:8000],
                 )
-                self._save_code_block(block, commit_hash)
+
+                if cb_id:
+                    self._mark_block_success(cb_id)
+
                 return {
                     "block": block,
                     "description": description,
@@ -664,29 +755,44 @@ class RepoAnalyzer:
                 }
             except Exception as e:
                 logger.warning("Failed to generate knowledge for %s:%s: %s",
-                               block["file_path"], block["block_name"], e)
+                               block.get("file_path"), block.get("block_name"), e)
+                if cb_id:
+                    self._mark_block_failed(cb_id, str(e))
                 return None
 
+        throttle = _ProgressThrottle(total)
         with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = {
-                executor.submit(process_block, i, b): i
-                for i, b in enumerate(blocks)
-            }
+            futures = {executor.submit(process_block, b): b for b in blocks}
             done_count = 0
-            gen_throttle = _ProgressThrottle(total)
             for future in as_completed(futures):
                 result = future.result()
                 if result:
                     entries.append(result)
+                else:
+                    failed += 1
                 done_count += 1
-                if notify_fn and gen_throttle.should_notify(done_count):
+                if notify_fn and throttle.should_notify(done_count):
                     pct = done_count * 100 // total
                     notify_fn(f"🤖 正在生成知识摘要（{pct}%，{done_count}/{total} 个代码块）...")
 
-        return entries
+        return entries, failed
 
-    def _store_knowledge(self, kb_id: int, entries: list[dict[str, Any]]) -> None:
-        """Embed and store knowledge entries in Milvus."""
+    def _store_block_knowledge(self, kb_id: int, entries: list[dict[str, Any]]) -> None:
+        """Embed and store block-level knowledge in Milvus.
+
+        Before inserting, delete old Milvus entries for the same blocks
+        (identified by file_path) to avoid duplicates.
+        """
+        # Collect file paths that need cleaning
+        file_paths = {e["block"]["file_path"] for e in entries}
+        for fpath in file_paths:
+            try:
+                milvus_service.delete_by_expr(
+                    kb_id, f'file_path == "{fpath}" and block_type != "module_summary" and block_type != "repo_summary"',
+                )
+            except Exception as e:
+                logger.warning("Failed to clean old block knowledge for %s: %s", fpath, e)
+
         texts = [e["description"] for e in entries]
         vectors = embedding_service.embed_batch(texts)
 
@@ -695,33 +801,223 @@ class RepoAnalyzer:
             block = entry["block"]
             milvus_entries.append({
                 "vector": vec,
-                "topic": f"{block['file_path']}:{block['block_name']}",
+                "topic": f"{block['file_path']}:{block.get('block_name', '')}",
                 "content": entry["description"][:5000],
                 "source": "code",
-                "source_detail": f"{block['file_path']}:{block['start_line']}-{block['end_line']}",
+                "source_detail": f"{block['file_path']}:{block.get('start_line', 0)}-{block.get('end_line', 0)}",
                 "certainty": "confirmed",
                 "kb_id": kb_id,
                 "last_updated_at": int(time.time()),
                 "last_referenced_at": int(time.time()),
-                # Dynamic fields for code knowledge
                 "file_path": block["file_path"],
-                "language": block["language"],
+                "language": block.get("language", ""),
                 "block_type": block["block_type"],
-                "block_name": block["block_name"] or "",
+                "block_name": block.get("block_name") or "",
                 "commit_hash": entry["commit_hash"],
             })
 
         milvus_service.insert_knowledge_dicts(kb_id, milvus_entries)
 
+    # ================================================================== #
+    #  Module-level summaries                                              #
+    # ================================================================== #
+
+    def _get_affected_modules(
+        self,
+        repo_id: int,
+        blocks_processed: list[dict[str, Any]],
+        changed_files: list[dict[str, str]] | None,
+    ) -> set[str]:
+        """Determine which module directories need summary regeneration."""
+        affected: set[str] = set()
+
+        # Modules affected by newly generated blocks
+        for block in blocks_processed:
+            affected.add(_module_path(block["file_path"]))
+
+        # Modules affected by deleted files
+        if changed_files:
+            for cf in changed_files:
+                if cf["status"] == "D":
+                    affected.add(_module_path(cf["path"]))
+
+        return affected
+
+    def _regenerate_module_summaries(
+        self,
+        kb_id: int,
+        repo_id: int,
+        affected_dirs: set[str],
+        repo_map: str,
+        notify_fn: Any = None,
+    ) -> int:
+        """Regenerate module summaries for affected directories.
+
+        Returns count of successfully updated modules.
+        """
+        updated = 0
+
+        for module_dir in affected_dirs:
+            try:
+                # Collect block-level descriptions for this module
+                with get_session() as session:
+                    blocks = session.execute(
+                        select(CodeBlock).where(
+                            CodeBlock.repo_id == repo_id,
+                            CodeBlock.status == "success",
+                            CodeBlock.file_path.like(f"{module_dir}/%") if module_dir != "." else CodeBlock.file_path.not_like("%/%"),
+                        )
+                    ).scalars().all()
+
+                if not blocks:
+                    # Module has no successful blocks – delete stale summary
+                    try:
+                        milvus_service.delete_by_expr(
+                            kb_id, f'block_type == "module_summary" and file_path == "{module_dir}"',
+                        )
+                    except Exception:
+                        pass
+                    continue
+
+                # Build a digest of block descriptions from Milvus
+                block_summaries = self._collect_block_descriptions(kb_id, module_dir, blocks)
+
+                # Call LLM
+                summary = llm_service.generate_module_summary(
+                    repo_map=repo_map,
+                    module_path=module_dir,
+                    block_summaries=block_summaries,
+                )
+
+                # Delete old module summary in Milvus, then insert new one
+                try:
+                    milvus_service.delete_by_expr(
+                        kb_id, f'block_type == "module_summary" and file_path == "{module_dir}"',
+                    )
+                except Exception:
+                    pass
+
+                vec = embedding_service.embed(summary)
+                milvus_service.insert_knowledge_dicts(kb_id, [{
+                    "vector": vec,
+                    "topic": f"模块摘要：{module_dir}",
+                    "content": summary[:5000],
+                    "source": "code",
+                    "source_detail": f"module:{module_dir}",
+                    "certainty": "confirmed",
+                    "kb_id": kb_id,
+                    "last_updated_at": int(time.time()),
+                    "last_referenced_at": int(time.time()),
+                    "file_path": module_dir,
+                    "language": "",
+                    "block_type": "module_summary",
+                    "block_name": module_dir,
+                    "commit_hash": "",
+                }])
+
+                updated += 1
+
+            except Exception as e:
+                logger.warning("Failed to generate module summary for %s: %s", module_dir, e)
+
+        return updated
+
+    def _collect_block_descriptions(
+        self, kb_id: int, module_dir: str, blocks: list[Any],
+    ) -> str:
+        """Collect existing block-level descriptions from Milvus for a module."""
+        parts: list[str] = []
+        for block in blocks[:50]:  # Limit to avoid huge prompts
+            parts.append(
+                f"- [{block.block_type}] {block.file_path}:{block.block_name}"
+                f" (L{block.start_line}-{block.end_line})"
+            )
+
+        # Also try to fetch actual content from Milvus
+        try:
+            results = milvus_service.get_all_entries(
+                kb_id, limit=50,
+                output_fields=["topic", "content", "file_path", "block_type"],
+            )
+            for r in results:
+                fp = r.get("file_path", "")
+                bt = r.get("block_type", "")
+                if bt in ("module_summary", "repo_summary"):
+                    continue
+                if module_dir == ".":
+                    if "/" in fp:
+                        continue
+                elif not fp.startswith(module_dir + "/"):
+                    continue
+                content = r.get("content", "")
+                if content:
+                    parts.append(f"\n### {r.get('topic', fp)}\n{content[:500]}")
+        except Exception:
+            pass
+
+        return "\n".join(parts) if parts else "（无已生成的代码块描述）"
+
+    # ================================================================== #
+    #  Repo-level overview                                                 #
+    # ================================================================== #
+
+    def _regenerate_repo_overview(self, kb_id: int, repo_id: int, repo_map: str) -> None:
+        """Regenerate the repository-level overview."""
+        try:
+            # Collect all module summaries from Milvus
+            results = milvus_service.get_all_entries(
+                kb_id, limit=200,
+                output_fields=["topic", "content", "block_type", "file_path"],
+            )
+            module_parts: list[str] = []
+            for r in results:
+                if r.get("block_type") == "module_summary":
+                    module_parts.append(f"### {r.get('file_path', '')}\n{r.get('content', '')}")
+
+            module_summaries = "\n\n".join(module_parts) if module_parts else "（暂无模块摘要）"
+
+            overview = llm_service.generate_repo_overview(
+                repo_map=repo_map,
+                module_summaries=module_summaries,
+            )
+
+            # Delete old overview, insert new
+            try:
+                milvus_service.delete_by_expr(kb_id, 'block_type == "repo_summary"')
+            except Exception:
+                pass
+
+            vec = embedding_service.embed(overview)
+            milvus_service.insert_knowledge_dicts(kb_id, [{
+                "vector": vec,
+                "topic": "仓库全局概览",
+                "content": overview[:5000],
+                "source": "code",
+                "source_detail": "repo:overview",
+                "certainty": "confirmed",
+                "kb_id": kb_id,
+                "last_updated_at": int(time.time()),
+                "last_referenced_at": int(time.time()),
+                "file_path": ".",
+                "language": "",
+                "block_type": "repo_summary",
+                "block_name": "overview",
+                "commit_hash": "",
+            }])
+
+        except Exception as e:
+            logger.warning("Failed to generate repo overview: %s", e)
+
+    # ================================================================== #
+    #  Cleanup helpers                                                     #
+    # ================================================================== #
+
     def _delete_file_knowledge(self, kb_id: int, repo_id: int, file_paths: list[str]) -> None:
-        """Delete knowledge entries for specific files from Milvus."""
         for fpath in file_paths:
             try:
                 milvus_service.delete_by_expr(kb_id, f'file_path == "{fpath}"')
             except Exception as e:
                 logger.warning("Failed to delete knowledge for %s: %s", fpath, e)
-
-        # Also clean up code_block records
         if file_paths:
             with get_session() as session:
                 session.execute(
@@ -731,31 +1027,16 @@ class RepoAnalyzer:
                     )
                 )
 
-    def _save_code_block(self, block: dict[str, Any], commit_hash: str) -> None:
-        """Save code block parsing record to MySQL."""
-        try:
-            with get_session() as session:
-                cb = CodeBlock(
-                    repo_id=block["repo_id"],
-                    file_path=block["file_path"],
-                    block_type=block["block_type"],
-                    block_name=block.get("block_name"),
-                    parent_class=block.get("parent_class"),
-                    start_line=block.get("start_line"),
-                    end_line=block.get("end_line"),
-                    signature=block.get("signature"),
-                    commit_hash=commit_hash,
-                )
-                session.add(cb)
-        except Exception:
-            pass  # Non-critical
+    # ================================================================== #
+    #  Task log helpers                                                    #
+    # ================================================================== #
 
     def _update_repo_commit(self, repo_id: int, commit_hash: str) -> None:
         with get_session() as session:
             session.execute(
-                update(CodeRepo)
-                .where(CodeRepo.id == repo_id)
-                .values(last_commit_hash=commit_hash, last_analyzed_at=datetime.utcnow())
+                update(CodeRepo).where(CodeRepo.id == repo_id).values(
+                    last_commit_hash=commit_hash, last_analyzed_at=datetime.utcnow(),
+                )
             )
 
     def _start_task_log(self, kb_id: int | None, task_type: str) -> int:
@@ -763,10 +1044,8 @@ class RepoAnalyzer:
             return 0
         with get_session() as session:
             log = SummarizeTaskLog(
-                kb_id=kb_id,
-                task_type=task_type,
-                status="running",
-                started_at=datetime.utcnow(),
+                kb_id=kb_id, task_type=task_type,
+                status="running", started_at=datetime.utcnow(),
             )
             session.add(log)
             session.flush()
@@ -777,9 +1056,7 @@ class RepoAnalyzer:
             return
         with get_session() as session:
             session.execute(
-                update(SummarizeTaskLog)
-                .where(SummarizeTaskLog.id == log_id)
-                .values(
+                update(SummarizeTaskLog).where(SummarizeTaskLog.id == log_id).values(
                     status=status,
                     message_count=stats.get("files_parsed", 0),
                     new_knowledge_count=stats.get("knowledge_generated", 0),
