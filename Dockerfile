@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 # Install git (needed for GitPython and repo cloning)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends git openssh-client && \
+    apt-get install -y --no-install-recommends git && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

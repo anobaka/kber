@@ -92,8 +92,6 @@ services:
       REDIS_URL: redis://redis:6379/0
     volumes:
       - repo_data:/data/repos
-      # Mount SSH key for private repos (optional)
-      # - ~/.ssh/id_rsa:/root/.ssh/id_rsa:ro
 
 volumes:
   mysql_data:

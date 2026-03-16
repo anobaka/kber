@@ -25,7 +25,7 @@ from app.services.rag_service import rag_service
 logger = logging.getLogger(__name__)
 
 GIT_URL_PATTERN = re.compile(
-    r"^(git@[\w.\-]+:[\w.\-/]+\.git|https?://[\w.\-/]+\.git|https?://[\w.\-/]+)$"
+    r"^(https?://[\w.\-/]+\.git|https?://[\w.\-/]+)$"
 )
 
 
@@ -151,7 +151,7 @@ class CommandRouter:
             return
 
         if not GIT_URL_PATTERN.match(git_url):
-            self.bot.send_message(chat_id, "⚠️ Git 地址格式不正确，请使用 git@... 或 https://... 格式。")
+            self.bot.send_message(chat_id, "⚠️ Git 地址格式不正确，请使用 https://... 格式。")
             return
 
         with get_session() as session:

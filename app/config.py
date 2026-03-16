@@ -44,7 +44,7 @@ class Config:
     EMBEDDING_DIM: int = int(os.getenv("EMBEDDING_DIM", "1024"))
 
     # --- Git / Repo ---
-    GIT_SSH_KEY_PATH: str = os.getenv("GIT_SSH_KEY_PATH", "")
+    GIT_PAT: str = os.getenv("GIT_PAT", "")  # Personal Access Token for HTTPS clone
     REPOS_BASE_DIR: str = os.getenv("REPOS_BASE_DIR", "/data/repos")
 
     # --- Redis (optional) ---

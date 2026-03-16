@@ -227,17 +227,27 @@ class RepoAnalyzer:
     # Git operations
     # ------------------------------------------------------------------
 
-    def _git_env(self) -> dict[str, str]:
-        env = os.environ.copy()
-        if config.GIT_SSH_KEY_PATH:
-            env["GIT_SSH_COMMAND"] = f"ssh -i {config.GIT_SSH_KEY_PATH} -o StrictHostKeyChecking=no"
-        return env
+    @staticmethod
+    def _inject_pat(url: str) -> str:
+        """Inject PAT into an HTTPS git URL for authentication.
+
+        Converts https://github.com/org/repo.git
+             to https://{PAT}@github.com/org/repo.git
+        """
+        pat = config.GIT_PAT
+        if not pat:
+            return url
+        if url.startswith("https://"):
+            return url.replace("https://", f"https://{pat}@", 1)
+        if url.startswith("http://"):
+            return url.replace("http://", f"http://{pat}@", 1)
+        return url
 
     def _git_clone(self, url: str, dest: str, branch: str) -> None:
         os.makedirs(dest, exist_ok=True)
+        auth_url = self._inject_pat(url)
         subprocess.run(
-            ["git", "clone", "-b", branch, url, dest],
-            env=self._git_env(),
+            ["git", "clone", "-b", branch, auth_url, dest],
             check=True,
             capture_output=True,
             timeout=600,
@@ -248,7 +258,6 @@ class RepoAnalyzer:
         subprocess.run(
             ["git", "fetch", "origin"],
             cwd=repo_dir,
-            env=self._git_env(),
             check=True,
             capture_output=True,
             timeout=300,
@@ -256,7 +265,6 @@ class RepoAnalyzer:
         subprocess.run(
             ["git", "pull", "origin", branch],
             cwd=repo_dir,
-            env=self._git_env(),
             check=True,
             capture_output=True,
             timeout=300,
