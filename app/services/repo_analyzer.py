@@ -277,7 +277,7 @@ class RepoAnalyzer:
                     pct = (i + 1) * 100 // total_files
                     eta = parse_throttle.eta(i + 1)
                     eta_part = f"，预计{eta}" if eta else ""
-                    _notify(f"🔍 正在解析代码结构（{pct}%，{i + 1}/{total_files} 个文件{eta_part}）...", progress=True)
+                    _notify(f"🔍 正在解析代码结构（{pct}%{eta_part}）...", progress=True)
                 blocks = self._parse_file(fpath, repo_dir, repo_id)
                 new_blocks.extend(blocks)
                 stats["files_parsed"] += 1
@@ -843,7 +843,7 @@ class RepoAnalyzer:
                     pct = done_count * 100 // total
                     eta = throttle.eta(done_count)
                     eta_part = f"，预计{eta}" if eta else ""
-                    notify_fn(f"🤖 正在生成知识摘要（{pct}%，{done_count}/{total} 个代码块{eta_part}）...", progress=True)
+                    notify_fn(f"🤖 正在生成知识摘要（{pct}%{eta_part}）...", progress=True)
 
         return entries, failed
 
@@ -1002,7 +1002,7 @@ class RepoAnalyzer:
                     pct = done_count * 100 // len(dirs_list)
                     eta = throttle.eta(done_count)
                     eta_part = f"，预计{eta}" if eta else ""
-                    notify_fn(f"📝 正在更新模块摘要（{pct}%，{done_count}/{len(dirs_list)} 个模块{eta_part}）...", progress=True)
+                    notify_fn(f"📝 正在更新模块摘要（{pct}%{eta_part}）...", progress=True)
 
         return updated
 
