@@ -279,52 +279,69 @@ class CommandRouter:
 
     def _add_knowledge(self, chat_id: str, sender_id: str, content: str) -> None:
         if not content:
-            self.bot.send_message(chat_id, "⚠️ 知识内容不能为空，请使用格式：添加知识 {内容}")
-            return
-
-        if len(content) > 5000:
-            self.bot.send_message(chat_id, "⚠️ 知识内容过长，请控制在 5000 字符以内。")
+            self.bot.send_message(
+                chat_id,
+                "⚠️ 知识内容不能为空，请使用格式：添加知识 {内容} 或 添加知识 {知识库名称} {内容}",
+            )
             return
 
         with get_session() as session:
-            # Get non-code KB bindings
-            bindings = session.execute(
-                select(ChatKbBinding.kb_id).where(
+            # Get non-code KBs bound to this chat
+            bound_kbs = session.execute(
+                select(KnowledgeBase).join(
+                    ChatKbBinding, ChatKbBinding.kb_id == KnowledgeBase.id,
+                ).where(
                     ChatKbBinding.chat_id == chat_id,
                     ChatKbBinding.deleted_at.is_(None),
-                )
-            ).scalars().all()
-
-            if not bindings:
-                self.bot.send_message(chat_id, "⚠️ 本群尚未绑定知识库，请先发送「绑定知识库 {名称}」进行绑定。")
-                return
-
-            # Filter out code-type KBs
-            kb_ids = session.execute(
-                select(KnowledgeBase.id).where(
-                    KnowledgeBase.id.in_(bindings),
                     KnowledgeBase.kb_type != "code",
                     KnowledgeBase.deleted_at.is_(None),
                 )
             ).scalars().all()
 
-            if not kb_ids:
-                self.bot.send_message(chat_id, "⚠️ 本群绑定的知识库均为代码库，无法手动添加知识。请先绑定一个聊天知识库。")
+            if not bound_kbs:
+                self.bot.send_message(chat_id, "⚠️ 本群尚未绑定非代码知识库，请先发送「绑定知识库 {名称}」进行绑定。")
                 return
 
-            for kb_id in kb_ids:
-                session.add(ManualKnowledge(
-                    kb_id=kb_id,
-                    chat_id=chat_id,
-                    sender_id=sender_id,
-                    content=content,
-                ))
+            # Try to parse optional KB name: first word might be a KB name
+            target_kb = None
+            kb_names = {kb.name for kb in bound_kbs}
+            first_word = content.split()[0] if content.split() else ""
+            if first_word in kb_names:
+                target_kb_name = first_word
+                content = content[len(first_word):].strip()
+                if not content:
+                    self.bot.send_message(chat_id, "⚠️ 知识内容不能为空。")
+                    return
+                target_kb = next(kb for kb in bound_kbs if kb.name == target_kb_name)
 
-        self.bot.send_message(chat_id, "✅ 知识已添加，正在归纳整合中。")
+            if target_kb is None:
+                if len(bound_kbs) == 1:
+                    target_kb = bound_kbs[0]
+                else:
+                    # Multiple KBs, must specify
+                    kb_list = "\n".join(f"  - {kb.name}" for kb in bound_kbs)
+                    self.bot.send_message(
+                        chat_id,
+                        f"⚠️ 本群绑定了多个知识库，请指定目标知识库：\n{kb_list}\n\n"
+                        f"格式：添加知识 {{知识库名称}} {{内容}}",
+                    )
+                    return
 
-        # Trigger immediate summarization
-        for kb_id in kb_ids:
-            self._async_summarize(kb_id)
+            if len(content) > 5000:
+                self.bot.send_message(chat_id, "⚠️ 知识内容过长，请控制在 5000 字符以内。")
+                return
+
+            session.add(ManualKnowledge(
+                kb_id=target_kb.id,
+                chat_id=chat_id,
+                sender_id=sender_id,
+                content=content,
+            ))
+            kb_id = target_kb.id
+            kb_name = target_kb.name
+
+        self.bot.send_message(chat_id, f"✅ 知识已添加到「{kb_name}」，正在归纳整合中。")
+        self._async_summarize(kb_id)
 
     def _force_summarize(self, chat_id: str, sender_id: str) -> None:
         if not self._is_admin(sender_id):
@@ -452,7 +469,7 @@ class CommandRouter:
 **解绑知识库** {名称}　— 解除本群与知识库的绑定
 **绑定代码库** {org/repo 或 完整URL}　— 关联代码库并自动分析
 **解绑代码库** {org/repo 或 完整URL}　— 解除代码库关联
-**添加知识** {内容}　— 手动向知识库添加一条知识
+**添加知识** [知识库名称] {内容}　— 手动添加知识（单知识库时可省略名称）
 **帮助**　— 显示本帮助信息
 
 🔒 **管理员命令：**
