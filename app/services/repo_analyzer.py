@@ -208,11 +208,12 @@ class RepoAnalyzer:
         task_log_id = self._start_task_log(kb_id, "code")
 
         # Unified notification helper.
-        # progress=True → edit the previous progress message in-place.
-        def _notify(msg: str, *, progress: bool = False) -> None:
+        # progress=True → edit the previous progress card in-place.
+        # done=True → final update for a phase (update card, then clear tracking).
+        def _notify(msg: str, *, progress: bool = False, done: bool = False) -> None:
             if not progress:
-                # Phase change: clear tracked progress card so next progress
-                # notification creates a fresh card instead of editing the old one.
+                # Non-progress message: clear tracked card so next progress
+                # notification creates a fresh card.
                 clear_progress_msg("repo", repo_id)
             notify_repo(repo_id, msg, progress=progress)
             if notify_chat_ids:
@@ -225,6 +226,9 @@ class RepoAnalyzer:
                                 _send_or_update(cid, msg, "repo", repo_id)
                             else:
                                 _send_fn(cid, msg)
+            if done:
+                # Phase finished: clear tracking so next phase gets a fresh card.
+                clear_progress_msg("repo", repo_id)
 
         total_files = 0
         try:
@@ -232,7 +236,7 @@ class RepoAnalyzer:
             # Step 1: Git clone / pull
             # ----------------------------------------------------------
             _check()
-            _notify("📦 正在同步代码仓库...")
+            _notify("📦 正在同步代码仓库...", progress=True)
 
             is_new = not os.path.exists(os.path.join(repo_dir, ".git"))
             if is_new:
@@ -248,11 +252,13 @@ class RepoAnalyzer:
             else:
                 changed_files = None  # all files
 
+            _notify("✅ 代码仓库同步完成", progress=True, done=True)
+
             # ----------------------------------------------------------
             # Step 2: Scan & filter files
             # ----------------------------------------------------------
             _check()
-            _notify("🔍 正在扫描文件...")
+            _notify("🔍 正在扫描文件...", progress=True)
 
             all_files = self._scan_files(repo_dir)
             if changed_files is not None:
@@ -264,6 +270,7 @@ class RepoAnalyzer:
                 files_to_process = all_files
 
             total_files = len(files_to_process)
+            _notify("✅ 文件扫描完成", progress=True, done=True)
 
             # ----------------------------------------------------------
             # Step 3: AST parse → code blocks
@@ -283,7 +290,7 @@ class RepoAnalyzer:
                 stats["files_parsed"] += 1
 
             if total_files:
-                _notify("✅ 代码结构解析完成", progress=True)
+                _notify("✅ 代码结构解析完成", progress=True, done=True)
 
             # ----------------------------------------------------------
             # Step 4: Upsert code_block records, detect what needs LLM
@@ -318,8 +325,9 @@ class RepoAnalyzer:
 
                 # Write successful entries to Milvus
                 if success_entries:
-                    _notify("💾 正在写入代码块知识...")
+                    _notify("💾 正在写入代码块知识...", progress=True)
                     self._store_block_knowledge(kb_id, success_entries)
+                    _notify("✅ 代码块知识写入完成", progress=True, done=True)
 
             # Always advance commit hash (file-level checkpoint)
             self._update_repo_commit(repo_id, current_commit)
@@ -344,8 +352,9 @@ class RepoAnalyzer:
             # ----------------------------------------------------------
             _check()
             if blocks_to_generate or affected_dirs:
-                _notify("📋 正在更新仓库概览...")
+                _notify("📋 正在更新仓库概览...", progress=True)
                 self._regenerate_repo_overview(kb_id, repo_id, repo_map)
+                _notify("✅ 仓库概览更新完成", progress=True, done=True)
 
             self._finish_task_log(task_log_id, "success", stats)
 
@@ -849,7 +858,7 @@ class RepoAnalyzer:
                     notify_fn(f"🤖 正在生成知识摘要（{pct}%{eta_part}）...", progress=True)
 
         if notify_fn and total:
-            notify_fn("✅ 知识摘要生成完成", progress=True)
+            notify_fn("✅ 知识摘要生成完成", progress=True, done=True)
 
         return entries, failed
 
@@ -1011,7 +1020,7 @@ class RepoAnalyzer:
                     notify_fn(f"📝 正在更新模块摘要（{pct}%{eta_part}）...", progress=True)
 
         if notify_fn and dirs_list:
-            notify_fn("✅ 模块摘要更新完成", progress=True)
+            notify_fn("✅ 模块摘要更新完成", progress=True, done=True)
 
         return updated
 
