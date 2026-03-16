@@ -786,7 +786,7 @@ class RepoAnalyzer:
                 return None
 
         throttle = _ProgressThrottle(total)
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        with ThreadPoolExecutor(max_workers=config.LLM_CONCURRENCY_BLOCK) as executor:
             futures = {executor.submit(process_block, b): b for b in blocks}
             done_count = 0
             for future in as_completed(futures):
@@ -946,7 +946,7 @@ class RepoAnalyzer:
                 logger.warning("Failed to generate module summary for %s: %s", module_dir, e)
                 return False
 
-        with ThreadPoolExecutor(max_workers=3) as executor:
+        with ThreadPoolExecutor(max_workers=config.LLM_CONCURRENCY_MODULE) as executor:
             futures = {executor.submit(_process_module, d): d for d in dirs_list}
             done_count = 0
             throttle = _ProgressThrottle(len(dirs_list))

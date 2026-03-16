@@ -57,6 +57,10 @@ class Config:
     KNOWLEDGE_COLD_DAYS: int = int(os.getenv("KNOWLEDGE_COLD_DAYS", "90"))
     SIMILARITY_MERGE_THRESHOLD: float = float(os.getenv("SIMILARITY_MERGE_THRESHOLD", "0.92"))
 
+    # --- Concurrency ---
+    LLM_CONCURRENCY_BLOCK: int = int(os.getenv("LLM_CONCURRENCY_BLOCK", "5"))
+    LLM_CONCURRENCY_MODULE: int = int(os.getenv("LLM_CONCURRENCY_MODULE", "3"))
+
     # --- Scheduler ---
     SUMMARIZE_INTERVAL_MINUTES: int = int(os.getenv("SUMMARIZE_INTERVAL_MINUTES", "5"))
     HISTORY_COMPENSATE_INTERVAL_MINUTES: int = int(os.getenv("HISTORY_COMPENSATE_INTERVAL_MINUTES", "30"))

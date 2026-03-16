@@ -1,7 +1,9 @@
 """Feishu bot event handler – receives messages via WebSocket long connection."""
 
+import collections
 import json
 import logging
+import threading
 from typing import Any
 
 import lark_oapi as lark
@@ -19,12 +21,17 @@ from app.db.session import get_session
 logger = logging.getLogger(__name__)
 
 
+_DEDUP_MAX = 1024
+
+
 class FeishuBot:
     """Feishu (Lark) bot for receiving and sending messages."""
 
     def __init__(self) -> None:
         self._client: lark.Client | None = None
         self._ws_client: Any = None
+        self._seen_msg_ids: collections.OrderedDict[str, None] = collections.OrderedDict()
+        self._seen_lock = threading.Lock()
 
     @property
     def client(self) -> lark.Client:
@@ -61,12 +68,27 @@ class FeishuBot:
         logger.info("Starting Feishu bot WebSocket connection...")
         self._ws_client.start()
 
+    def _is_duplicate(self, message_id: str) -> bool:
+        """Return True if this message_id was already seen (LRU dedup)."""
+        with self._seen_lock:
+            if message_id in self._seen_msg_ids:
+                return True
+            self._seen_msg_ids[message_id] = None
+            if len(self._seen_msg_ids) > _DEDUP_MAX:
+                self._seen_msg_ids.popitem(last=False)
+            return False
+
     def _on_message(self, ctx: Any, event: Any, router: Any) -> None:
         """Handle incoming message event."""
         try:
             msg = event.event.message
             chat_id = msg.chat_id
             message_id = msg.message_id
+
+            if self._is_duplicate(message_id):
+                logger.debug("Duplicate message ignored: %s", message_id)
+                return
+
             msg_type = msg.message_type
             sender_id = event.event.sender.sender_id.open_id
 
