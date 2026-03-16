@@ -86,7 +86,7 @@ class _ProgressThrottle:
     """Throttle progress notifications: at most every *interval* seconds or
     every *pct_step* percent of total, whichever comes first."""
 
-    def __init__(self, total: int, interval: float = 5.0, pct_step: int = 10) -> None:
+    def __init__(self, total: int, interval: float = 3.0, pct_step: int = 1) -> None:
         self._total = total
         self._interval = interval
         self._pct_step = pct_step
@@ -153,7 +153,9 @@ class RepoAnalyzer:
         Returns stats dict ``{files_parsed, blocks_found, blocks_success,
         blocks_failed, knowledge_generated, modules_updated}``.
         """
-        from app.services.debug_notifier import get_debug_chat_ids_for_repo, notify_repo
+        from app.services.debug_notifier import (
+            clear_progress_msg, get_debug_chat_ids_for_repo, notify_repo,
+        )
 
         stats: dict[str, int] = {
             "files_parsed": 0, "blocks_found": 0, "blocks_success": 0,
@@ -180,16 +182,20 @@ class RepoAnalyzer:
         repo_dir = os.path.join(config.REPOS_BASE_DIR, str(repo_id))
         task_log_id = self._start_task_log(kb_id, "code")
 
-        # Unified notification helper
-        def _notify(msg: str) -> None:
-            notify_repo(repo_id, msg)
+        # Unified notification helper.
+        # progress=True → edit the previous progress message in-place.
+        def _notify(msg: str, *, progress: bool = False) -> None:
+            notify_repo(repo_id, msg, progress=progress)
             if notify_chat_ids:
-                from app.services.debug_notifier import _send_fn
+                from app.services.debug_notifier import _send_fn, _send_or_update
                 if _send_fn:
                     debug_ids = set(get_debug_chat_ids_for_repo(repo_id))
                     for cid in notify_chat_ids:
                         if cid not in debug_ids:
-                            _send_fn(cid, msg)
+                            if progress:
+                                _send_or_update(cid, msg, "repo", repo_id)
+                            else:
+                                _send_fn(cid, msg)
 
         total_files = 0
         try:
@@ -240,7 +246,7 @@ class RepoAnalyzer:
                 if parse_throttle.should_notify(i + 1):
                     _check()
                     pct = (i + 1) * 100 // total_files
-                    _notify(f"🔍 正在解析代码结构（{pct}%，{i + 1}/{total_files} 个文件）...")
+                    _notify(f"🔍 正在解析代码结构（{pct}%，{i + 1}/{total_files} 个文件）...", progress=True)
                 blocks = self._parse_file(fpath, repo_dir, repo_id)
                 new_blocks.extend(blocks)
                 stats["files_parsed"] += 1
@@ -317,11 +323,13 @@ class RepoAnalyzer:
                 summary_parts.append(f"{stats['blocks_failed']} 个代码块失败（将在下次重试）")
             if stats["modules_updated"]:
                 summary_parts.append(f"更新 {stats['modules_updated']} 个模块摘要")
+            clear_progress_msg("repo", repo_id)
             _notify(f"✅ 代码库分析完成！{'，'.join(summary_parts)}。")
 
         except CancelledError:
             logger.info("Repo analysis cancelled for repo_id=%d", repo_id)
             self._finish_task_log(task_log_id, "failed", stats, "用户取消")
+            clear_progress_msg("repo", repo_id)
             _notify(
                 f"🛑 代码库分析已停止。"
                 f"已完成：{stats['files_parsed']} 个文件解析，{stats['knowledge_generated']} 条知识。"
@@ -330,6 +338,7 @@ class RepoAnalyzer:
         except Exception as e:
             logger.exception("Repo analysis failed for repo_id=%d", repo_id)
             self._finish_task_log(task_log_id, "failed", stats, str(e))
+            clear_progress_msg("repo", repo_id)
             _notify(
                 f"⚠️ 代码库分析失败：{str(e)[:100]}，"
                 f"已成功处理 {stats['files_parsed']}/{total_files} 个文件。"
@@ -801,7 +810,7 @@ class RepoAnalyzer:
                 done_count += 1
                 if notify_fn and throttle.should_notify(done_count):
                     pct = done_count * 100 // total
-                    notify_fn(f"🤖 正在生成知识摘要（{pct}%，{done_count}/{total} 个代码块）...")
+                    notify_fn(f"🤖 正在生成知识摘要（{pct}%，{done_count}/{total} 个代码块）...", progress=True)
 
         return entries, failed
 
@@ -958,7 +967,7 @@ class RepoAnalyzer:
                 done_count += 1
                 if notify_fn and throttle.should_notify(done_count):
                     pct = done_count * 100 // len(dirs_list)
-                    notify_fn(f"📝 正在更新模块摘要（{pct}%，{done_count}/{len(dirs_list)} 个模块）...")
+                    notify_fn(f"📝 正在更新模块摘要（{pct}%，{done_count}/{len(dirs_list)} 个模块）...", progress=True)
 
         return updated
 

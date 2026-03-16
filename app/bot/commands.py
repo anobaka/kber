@@ -84,6 +84,7 @@ class CommandRouter:
         ("添加知识", "add-knowledge", "_add_knowledge"),
         ("重建知识库", "rebuild-kb", "_rebuild_kb"),
         ("停止构建", "stop-build", "_stop_build"),
+        ("恢复构建", "resume-build", "_resume_build"),
     ]
 
     # Commands that must match exactly (no parameter).
@@ -532,6 +533,59 @@ class CommandRouter:
         ev.set()
         self.bot.send_message(chat_id, f"🛑 正在停止知识库「{kb_name}」的构建任务...")
 
+    def _resume_build(self, chat_id: str, sender_id: str, kb_name: str) -> None:
+        if not self._is_admin(sender_id):
+            self.bot.send_message(chat_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
+            return
+
+        if not kb_name:
+            self.bot.send_message(chat_id, "⚠️ 请指定知识库名称，格式：恢复构建 {名称} / resume-build {name}")
+            return
+
+        with get_session() as session:
+            kb = session.execute(
+                select(KnowledgeBase).where(
+                    KnowledgeBase.name == kb_name,
+                    KnowledgeBase.deleted_at.is_(None),
+                )
+            ).scalar_one_or_none()
+
+        if not kb:
+            self.bot.send_message(chat_id, f"⚠️ 未找到知识库「{kb_name}」。")
+            return
+
+        # Find code repos bound to this KB
+        with get_session() as session:
+            repos = session.execute(
+                select(CodeRepo).where(
+                    CodeRepo.kb_id == kb.id,
+                    CodeRepo.deleted_at.is_(None),
+                )
+            ).scalars().all()
+
+            if not repos:
+                self.bot.send_message(chat_id, f"⚠️ 知识库「{kb_name}」没有关联的代码库。")
+                return
+
+            # Show pending/failed block stats
+            pending_count = session.execute(
+                select(func.count(CodeBlock.id)).where(
+                    CodeBlock.repo_id.in_([r.id for r in repos]),
+                    CodeBlock.status.in_(["pending", "failed"]),
+                )
+            ).scalar() or 0
+
+            repo_ids = [r.id for r in repos]
+
+        self.bot.send_message(
+            chat_id,
+            f"🔄 正在恢复构建知识库「{kb_name}」"
+            f"（{pending_count} 个代码块待处理）...",
+        )
+
+        for rid in repo_ids:
+            self._async_repo_analysis(rid, chat_id)
+
     def _query_kb_status(self, chat_id: str, sender_id: str) -> None:
         if not self._is_admin(sender_id):
             self.bot.send_message(chat_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
@@ -633,6 +687,7 @@ class CommandRouter:
 **立即总结 / summarize**　— 立即触发知识归纳任务 / Trigger summarization now
 **重建知识库 / rebuild-kb** {名称}　— 清除并重建指定知识库 / Rebuild a knowledge base
 **停止构建 / stop-build** {名称}　— 停止正在构建的知识库任务 / Stop an ongoing build task
+**恢复构建 / resume-build** {名称}　— 恢复中断的构建任务 / Resume an interrupted build task
 **查询知识库 / list-kb**　— 查看所有知识库状态 / List all knowledge bases
 **enable-debug**　— 开启本群 Debug 模式 / Enable debug mode
 **disable-debug**　— 关闭本群 Debug 模式 / Disable debug mode

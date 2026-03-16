@@ -12,6 +12,8 @@ from lark_oapi.api.im.v1 import (
     CreateMessageRequestBody,
     GetChatRequest,
     ListMessageRequest,
+    PatchMessageRequest,
+    PatchMessageRequestBody,
 )
 
 from app.config import config
@@ -46,10 +48,11 @@ class FeishuBot:
     def start(self, message_handler: Any) -> None:
         """Start the WebSocket long connection to receive messages."""
         from app.bot.commands import CommandRouter
-        from app.services.debug_notifier import set_send_fn
+        from app.services.debug_notifier import set_send_fn, set_update_fn
 
-        # Register send function for debug notifications
+        # Register send/update functions for debug notifications
         set_send_fn(self.send_message)
+        set_update_fn(self.update_message)
 
         router = CommandRouter(self)
 
@@ -158,8 +161,8 @@ class FeishuBot:
         except Exception:
             logger.exception("Failed to collect message %s", message_id)
 
-    def send_message(self, chat_id: str, text: str, msg_type: str = "text") -> None:
-        """Send a message to a Feishu chat."""
+    def send_message(self, chat_id: str, text: str, msg_type: str = "text") -> str | None:
+        """Send a message to a Feishu chat. Returns the message_id on success."""
         try:
             if msg_type == "text":
                 content = json.dumps({"text": text})
@@ -182,8 +185,33 @@ class FeishuBot:
             response = self.client.im.v1.message.create(request)
             if not response.success():
                 logger.error("Failed to send message: %s", response.msg)
+                return None
+            return response.data.message_id if response.data else None
         except Exception:
             logger.exception("Failed to send message to %s", chat_id)
+            return None
+
+    def update_message(self, message_id: str, text: str) -> bool:
+        """Update an existing Feishu message in-place. Returns True on success."""
+        try:
+            content = json.dumps({"text": text})
+            request = PatchMessageRequest.builder() \
+                .message_id(message_id) \
+                .request_body(
+                    PatchMessageRequestBody.builder()
+                    .content(content)
+                    .build()
+                ) \
+                .build()
+
+            response = self.client.im.v1.message.patch(request)
+            if not response.success():
+                logger.error("Failed to update message %s: %s", message_id, response.msg)
+                return False
+            return True
+        except Exception:
+            logger.exception("Failed to update message %s", message_id)
+            return False
 
     def send_card(self, chat_id: str, title: str, content: str) -> None:
         """Send an interactive card message."""

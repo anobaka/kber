@@ -1,6 +1,7 @@
 """Debug notification helper – sends progress messages to debug-enabled chats."""
 
 import logging
+import threading
 from typing import Any, Callable
 
 from sqlalchemy import select
@@ -11,22 +12,78 @@ from app.db.session import get_session
 logger = logging.getLogger(__name__)
 
 # Lazy reference to avoid circular imports; set by bot startup.
-_send_fn: Callable[[str, str], None] | None = None
+_send_fn: Callable[[str, str], str | None] | None = None
+_update_fn: Callable[[str, str], bool] | None = None
+
+# Per-chat last progress message_id for in-place updates.
+# Key: (context_type, context_id, chat_id) → message_id
+_progress_msg_ids: dict[tuple[str, Any, str], str] = {}
+_progress_lock = threading.Lock()
 
 
-def set_send_fn(fn: Callable[[str, str], None]) -> None:
+def set_send_fn(fn: Callable[[str, str], str | None]) -> None:
     """Register the bot's send_message function (called once at startup)."""
     global _send_fn
     _send_fn = fn
 
 
-def _send(chat_id: str, message: str) -> None:
+def set_update_fn(fn: Callable[[str, str], bool]) -> None:
+    """Register the bot's update_message function (called once at startup)."""
+    global _update_fn
+    _update_fn = fn
+
+
+def _send(chat_id: str, message: str) -> str | None:
+    if _send_fn is None:
+        return None
+    try:
+        return _send_fn(chat_id, f"🔧 {message}")
+    except Exception:
+        logger.debug("Debug notify failed for %s", chat_id, exc_info=True)
+        return None
+
+
+def _send_or_update(
+    chat_id: str,
+    message: str,
+    context_type: str,
+    context_id: Any,
+) -> None:
+    """Send a new message or update the previous progress message in-place."""
+    key = (context_type, context_id, chat_id)
+    full_msg = f"🔧 {message}"
+
+    with _progress_lock:
+        prev_id = _progress_msg_ids.get(key)
+
+    # Try updating the previous message first
+    if prev_id and _update_fn:
+        try:
+            if _update_fn(prev_id, full_msg):
+                return
+        except Exception:
+            logger.debug("Update failed, will send new message", exc_info=True)
+
+    # Fallback: send a new message
     if _send_fn is None:
         return
     try:
-        _send_fn(chat_id, f"🔧 {message}")
+        msg_id = _send_fn(chat_id, full_msg)
+        if msg_id:
+            with _progress_lock:
+                _progress_msg_ids[key] = msg_id
     except Exception:
         logger.debug("Debug notify failed for %s", chat_id, exc_info=True)
+
+
+def clear_progress_msg(context_type: str, context_id: Any) -> None:
+    """Clear tracked progress message IDs for a context (e.g. after completion)."""
+    with _progress_lock:
+        keys_to_remove = [
+            k for k in _progress_msg_ids if k[0] == context_type and k[1] == context_id
+        ]
+        for k in keys_to_remove:
+            del _progress_msg_ids[k]
 
 
 # ------------------------------------------------------------------
@@ -98,10 +155,16 @@ def notify_kb(kb_id: int, message: str) -> None:
         _send(chat_id, message)
 
 
-def notify_repo(repo_id: int, message: str) -> None:
-    """Send a debug message to all debug-enabled chats bound to a repo."""
+def notify_repo(repo_id: int, message: str, *, progress: bool = False) -> None:
+    """Send a debug message to all debug-enabled chats bound to a repo.
+
+    If *progress* is True, the message is updated in-place (edit previous msg).
+    """
     for chat_id in get_debug_chat_ids_for_repo(repo_id):
-        _send(chat_id, message)
+        if progress:
+            _send_or_update(chat_id, message, "repo", repo_id)
+        else:
+            _send(chat_id, message)
 
 
 def notify_chat(chat_id: str, message: str) -> None:
