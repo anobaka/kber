@@ -74,35 +74,51 @@ class CommandRouter:
     def __init__(self, bot: Any) -> None:
         self.bot = bot
 
+    # Commands that take a parameter (prefix match).
+    # Each entry: (chinese_prefix, english_prefix, handler_method_name)
+    _PREFIX_COMMANDS: list[tuple[str, str, str]] = [
+        ("绑定知识库", "bind-kb", "_bind_kb"),
+        ("解绑知识库", "unbind-kb", "_unbind_kb"),
+        ("绑定代码库", "bind-repo", "_bind_repo"),
+        ("解绑代码库", "unbind-repo", "_unbind_repo"),
+        ("添加知识", "add-knowledge", "_add_knowledge"),
+        ("重建知识库", "rebuild-kb", "_rebuild_kb"),
+        ("停止构建", "stop-build", "_stop_build"),
+    ]
+
+    # Commands that must match exactly (no parameter).
+    # Each entry: (set_of_aliases, handler_method_name)
+    _EXACT_COMMANDS: list[tuple[set[str], str]] = [
+        ({"立即总结", "summarize"}, "_force_summarize"),
+        ({"查询知识库", "list-kb"}, "_query_kb_status"),
+    ]
+
     def handle(self, chat_id: str, message_id: str, sender_id: str, text: str) -> None:
         """Parse command prefix and dispatch."""
         text = text.strip()
 
-        if text.startswith("绑定知识库"):
-            self._bind_kb(chat_id, sender_id, text[len("绑定知识库"):].strip())
-        elif text.startswith("解绑知识库"):
-            self._unbind_kb(chat_id, sender_id, text[len("解绑知识库"):].strip())
-        elif text.startswith("绑定代码库"):
-            self._bind_repo(chat_id, sender_id, text[len("绑定代码库"):].strip())
-        elif text.startswith("解绑代码库"):
-            self._unbind_repo(chat_id, sender_id, text[len("解绑代码库"):].strip())
-        elif text.startswith("添加知识"):
-            self._add_knowledge(chat_id, sender_id, text[len("添加知识"):].strip())
-        elif text == "立即总结":
-            self._force_summarize(chat_id, sender_id)
-        elif text == "查询知识库":
-            self._query_kb_status(chat_id, sender_id)
-        elif text.startswith("重建知识库"):
-            self._rebuild_kb(chat_id, sender_id, text[len("重建知识库"):].strip())
-        elif text.startswith("停止构建"):
-            self._stop_build(chat_id, sender_id, text[len("停止构建"):].strip())
-        elif text == "enable-debug":
+        # Prefix commands (with parameter)
+        for cn, en, method in self._PREFIX_COMMANDS:
+            for prefix in (cn, en):
+                if text.startswith(prefix):
+                    arg = text[len(prefix):].strip()
+                    getattr(self, method)(chat_id, sender_id, arg)
+                    return
+
+        # Exact-match commands (no parameter)
+        for aliases, method in self._EXACT_COMMANDS:
+            if text in aliases:
+                getattr(self, method)(chat_id, sender_id)
+                return
+
+        # Special cases
+        if text in ("enable-debug",):
             self._set_debug(chat_id, sender_id, True)
-        elif text == "disable-debug":
+        elif text in ("disable-debug",):
             self._set_debug(chat_id, sender_id, False)
-        elif text in ("我的ID", "我的id", "myid"):
+        elif text.lower() in ("我的id", "myid"):
             self.bot.send_message(chat_id, f"你的用户 ID：`{sender_id}`")
-        elif text in ("帮助", "help"):
+        elif text.lower() in ("帮助", "help"):
             self._show_help(chat_id)
         else:
             # Free-form question → RAG
@@ -114,7 +130,7 @@ class CommandRouter:
 
     def _bind_kb(self, chat_id: str, sender_id: str, kb_name: str) -> None:
         if not kb_name:
-            self.bot.send_message(chat_id, "⚠️ 知识库名称不能为空，请使用格式：绑定知识库 {名称}")
+            self.bot.send_message(chat_id, "⚠️ 知识库名称不能为空，请使用格式：绑定知识库 {名称} / bind-kb {name}")
             return
 
         with get_session() as session:
@@ -163,7 +179,7 @@ class CommandRouter:
 
     def _unbind_kb(self, chat_id: str, sender_id: str, kb_name: str) -> None:
         if not kb_name:
-            self.bot.send_message(chat_id, "⚠️ 知识库名称不能为空，请使用格式：解绑知识库 {名称}")
+            self.bot.send_message(chat_id, "⚠️ 知识库名称不能为空，请使用格式：解绑知识库 {名称} / unbind-kb {name}")
             return
 
         with get_session() as session:
@@ -198,7 +214,7 @@ class CommandRouter:
         if not git_url:
             self.bot.send_message(
                 chat_id,
-                "⚠️ 代码库地址不能为空，请使用格式：绑定代码库 org/repo 或 绑定代码库 https://...",
+                "⚠️ 代码库地址不能为空，请使用格式：绑定代码库 org/repo / bind-repo org/repo",
             )
             return
 
@@ -305,7 +321,7 @@ class CommandRouter:
         if not content:
             self.bot.send_message(
                 chat_id,
-                "⚠️ 知识内容不能为空，请使用格式：添加知识 {内容} 或 添加知识 {知识库名称} {内容}",
+                "⚠️ 知识内容不能为空，请使用格式：添加知识 {内容} / add-knowledge {content}",
             )
             return
 
@@ -323,7 +339,7 @@ class CommandRouter:
             ).scalars().all()
 
             if not bound_kbs:
-                self.bot.send_message(chat_id, "⚠️ 本群尚未绑定非代码知识库，请先发送「绑定知识库 {名称}」进行绑定。")
+                self.bot.send_message(chat_id, "⚠️ 本群尚未绑定非代码知识库，请先发送「绑定知识库 {名称}」/ 「bind-kb {name}」进行绑定。")
                 return
 
             # Try to parse optional KB name: first word might be a KB name
@@ -347,7 +363,7 @@ class CommandRouter:
                     self.bot.send_message(
                         chat_id,
                         f"⚠️ 本群绑定了多个知识库，请指定目标知识库：\n{kb_list}\n\n"
-                        f"格式：添加知识 {{知识库名称}} {{内容}}",
+                        f"格式：添加知识 {{知识库名称}} {{内容}} / add-knowledge {{kb_name}} {{content}}",
                     )
                     return
 
@@ -419,7 +435,7 @@ class CommandRouter:
             return
 
         if not kb_name:
-            self.bot.send_message(chat_id, "⚠️ 请指定知识库名称，格式：重建知识库 {名称}")
+            self.bot.send_message(chat_id, "⚠️ 请指定知识库名称，格式：重建知识库 {名称} / rebuild-kb {name}")
             return
 
         with get_session() as session:
@@ -493,7 +509,7 @@ class CommandRouter:
             return
 
         if not kb_name:
-            self.bot.send_message(chat_id, "⚠️ 请指定知识库名称，格式：停止构建 {名称}")
+            self.bot.send_message(chat_id, "⚠️ 请指定知识库名称，格式：停止构建 {名称} / stop-build {name}")
             return
 
         with get_session() as session:
@@ -603,25 +619,25 @@ class CommandRouter:
         self.bot.send_message(chat_id, f"✅ 本群 Debug 模式{status}。")
 
     def _show_help(self, chat_id: str) -> None:
-        help_text = """📖 **可用命令：**
+        help_text = """📖 **可用命令 / Available Commands：**
 
-**绑定知识库** {名称}　— 将本群聊天记录纳入指定知识库
-**解绑知识库** {名称}　— 解除本群与知识库的绑定
-**绑定代码库** {org/repo 或 完整URL}　— 关联代码库并自动分析
-**解绑代码库** {org/repo 或 完整URL}　— 解除代码库关联
-**添加知识** [知识库名称] {内容}　— 手动添加知识（单知识库时可省略名称）
-**我的ID**　— 获取你的用户 ID（用于申请管理员权限）
-**帮助**　— 显示本帮助信息
+**绑定知识库 / bind-kb** {名称}　— 将本群聊天记录纳入指定知识库 / Bind this chat to a knowledge base
+**解绑知识库 / unbind-kb** {名称}　— 解除本群与知识库的绑定 / Unbind this chat from a knowledge base
+**绑定代码库 / bind-repo** {org/repo 或 URL}　— 关联代码库并自动分析 / Bind a code repo and start analysis
+**解绑代码库 / unbind-repo** {org/repo 或 URL}　— 解除代码库关联 / Unbind a code repo
+**添加知识 / add-knowledge** [知识库名称] {内容}　— 手动添加知识 / Manually add knowledge
+**我的ID / myid**　— 获取你的用户 ID / Get your user ID
+**帮助 / help**　— 显示本帮助信息 / Show this help message
 
-🔒 **管理员命令：**
-**立即总结**　— 立即触发知识归纳任务
-**重建知识库** {名称}　— 清除并重建指定知识库
-**停止构建** {名称}　— 停止正在构建的知识库任务
-**查询知识库**　— 查看所有知识库状态
-**enable-debug**　— 开启本群 Debug 模式（显示详细工作进度）
-**disable-debug**　— 关闭本群 Debug 模式
+🔒 **管理员命令 / Admin Commands：**
+**立即总结 / summarize**　— 立即触发知识归纳任务 / Trigger summarization now
+**重建知识库 / rebuild-kb** {名称}　— 清除并重建指定知识库 / Rebuild a knowledge base
+**停止构建 / stop-build** {名称}　— 停止正在构建的知识库任务 / Stop an ongoing build task
+**查询知识库 / list-kb**　— 查看所有知识库状态 / List all knowledge bases
+**enable-debug**　— 开启本群 Debug 模式 / Enable debug mode
+**disable-debug**　— 关闭本群 Debug 模式 / Disable debug mode
 
-💬 直接提问即可查询知识库，例如：「这个接口怎么调用？」"""
+💬 直接提问即可查询知识库 / Ask any question to query the knowledge base"""
         self.bot.send_card(chat_id, "帮助", help_text)
 
     def _rag_query(self, chat_id: str, sender_id: str, question: str) -> None:
