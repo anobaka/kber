@@ -11,6 +11,7 @@ dependencies = [
     "SQLAlchemy>=2.0",
     "pymysql>=1.1",
     "cryptography>=41.0",
+    "alembic>=1.13",
     "pymilvus>=2.4",
     "openai>=1.0",
     "tree-sitter>=0.23",

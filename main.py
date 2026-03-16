@@ -21,10 +21,12 @@ def main() -> None:
     from app.config import config
     os.makedirs(config.REPOS_BASE_DIR, exist_ok=True)
 
-    # Initialize database tables
-    logger.info("Initializing database...")
-    from app.db.session import init_db
-    init_db()
+    # Run database migrations (Alembic)
+    logger.info("Running database migrations...")
+    from alembic import command
+    from alembic.config import Config as AlembicConfig
+    alembic_cfg = AlembicConfig("alembic.ini")
+    command.upgrade(alembic_cfg, "head")
 
     # Connect to Milvus
     logger.info("Connecting to Milvus...")
