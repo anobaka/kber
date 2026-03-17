@@ -55,10 +55,20 @@ class FeishuBot:
                 .uri("/open-apis/bot/v3/info")
                 .build()
             )
+            logger.info(
+                "Bot info API response: success=%s, status_code=%s, raw=%s",
+                resp.success(),
+                getattr(getattr(resp, "raw", None), "status_code", None),
+                getattr(getattr(resp, "raw", None), "content", None),
+            )
             if resp.success():
                 import json as _json
                 data = _json.loads(resp.raw.content)
-                open_id = data.get("bot", {}).get("open_id", "")
+                # The response might be {"bot": {"open_id": ...}} or {"data": {"open_id": ...}}
+                open_id = (
+                    data.get("bot", {}).get("open_id", "")
+                    or data.get("data", {}).get("open_id", "")
+                )
                 if open_id:
                     logger.info("Bot open_id: %s", open_id)
                     return open_id
@@ -145,14 +155,23 @@ class FeishuBot:
             mentions = msg.mentions or []
             is_at_bot = False
             for m in mentions:
-                # Match by open_id if available, otherwise fall back to
-                # checking if any mention exists (legacy behaviour).
-                mention_id = getattr(getattr(m, "id", None), "open_id", None) or getattr(m, "id", None)
+                mention_id_obj = getattr(m, "id", None)
+                mention_open_id = getattr(mention_id_obj, "open_id", None)
+                # If m.id is a UserId object, use its open_id; otherwise m.id itself might be a string
+                mention_id = mention_open_id or mention_id_obj
+                logger.debug(
+                    "Mention: key=%s, name=%s, id_obj=%s, open_id=%s, bot_open_id=%s",
+                    getattr(m, "key", None), getattr(m, "name", None),
+                    mention_id_obj, mention_open_id, self._bot_open_id,
+                )
                 if self._bot_open_id and mention_id == self._bot_open_id:
                     is_at_bot = True
                 elif not self._bot_open_id:
                     # Fallback: if we couldn't fetch bot open_id, treat
                     # any mention as bot mention (same as before).
+                    logger.warning(
+                        "bot_open_id not set, falling back to treating all mentions as bot"
+                    )
                     is_at_bot = True
 
             # Remove @mention placeholders from text
