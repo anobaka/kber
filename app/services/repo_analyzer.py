@@ -366,8 +366,7 @@ class RepoAnalyzer:
 
             # Write all entries to Milvus (batch embedding)
             if all_entries:
-                _notify("💾 正在写入代码块知识...", progress=True)
-                self._store_block_knowledge(kb_id, all_entries)
+                self._store_block_knowledge(kb_id, all_entries, notify_fn=_notify)
                 _notify("✅ 代码块知识写入完成", progress=True, done=True)
 
             # Always advance commit hash (file-level checkpoint)
@@ -1115,14 +1114,26 @@ class RepoAnalyzer:
 
         return entries, failed
 
-    def _store_block_knowledge(self, kb_id: int, entries: list[dict[str, Any]]) -> None:
+    def _store_block_knowledge(
+        self,
+        kb_id: int,
+        entries: list[dict[str, Any]],
+        notify_fn: Any = None,
+    ) -> None:
         """Embed and store block-level knowledge in Milvus.
 
         Before inserting, delete old Milvus entries for the same blocks
         (identified by file_path) to avoid duplicates.
         """
-        # Collect file paths that need cleaning
+        total_entries = len(entries)
+
+        # --- Phase 1: Clean old Milvus entries ---
         file_paths = {e["block"]["file_path"] for e in entries}
+        if notify_fn:
+            notify_fn(
+                f"💾 正在清理旧向量（{len(file_paths)} 个文件）...",
+                progress=True,
+            )
         for fpath in file_paths:
             try:
                 milvus_service.delete_by_expr(
@@ -1131,7 +1142,7 @@ class RepoAnalyzer:
             except Exception as e:
                 logger.warning("Failed to clean old block knowledge for %s: %s", fpath, e)
 
-        # Split long descriptions into segments via LLM, then embed all at once.
+        # --- Phase 2: Split long descriptions into segments ---
         expanded: list[tuple[dict[str, Any], str]] = []  # (entry, segment)
         for entry in entries:
             desc = entry["description"]
@@ -1142,9 +1153,21 @@ class RepoAnalyzer:
             else:
                 expanded.append((entry, desc))
 
+        # --- Phase 3: Batch embedding ---
         texts = [seg for _, seg in expanded]
+        if notify_fn:
+            notify_fn(
+                f"💾 正在生成向量（{len(texts)} 段文本）...",
+                progress=True,
+            )
         vectors = embedding_service.embed_batch(texts)
 
+        # --- Phase 4: Write to Milvus ---
+        if notify_fn:
+            notify_fn(
+                f"💾 正在写入 Milvus（{total_entries} 个代码块）...",
+                progress=True,
+            )
         milvus_entries: list[dict[str, Any]] = []
         for vec, (entry, seg) in zip(vectors, expanded):
             block = entry["block"]
