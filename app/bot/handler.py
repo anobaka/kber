@@ -17,7 +17,7 @@ from lark_oapi.api.im.v1 import (
 )
 
 from app.config import config
-from app.db.models import ChatMessage
+from app.db.models import ChatMessage, ResponseFeedback
 from app.db.session import get_session
 
 logger = logging.getLogger(__name__)
@@ -97,10 +97,17 @@ class FeishuBot:
             ) \
             .build()
 
+        card_handler = lark.CardActionHandler.builder("", "") \
+            .register(
+                lambda ctx, card_action: self.handle_card_action(card_action)
+            ) \
+            .build()
+
         self._ws_client = lark.ws.Client(
             config.FEISHU_APP_ID,
             config.FEISHU_APP_SECRET,
             event_handler=event_handler,
+            card_handler=card_handler,
             log_level=lark.LogLevel.WARNING,
         )
         logger.info("Starting Feishu bot WebSocket connection...")
@@ -319,6 +326,280 @@ class FeishuBot:
             },
         }
         self.send_message(chat_id, json.dumps(post), msg_type="post")
+
+    def send_rag_answer_card(
+        self,
+        chat_id: str,
+        question: str,
+        answer: str,
+    ) -> str | None:
+        """Send an interactive card with the RAG answer and feedback buttons.
+
+        Returns the message_id of the sent card for feedback tracking.
+        """
+        card = self._build_rag_answer_card(answer, question)
+        return self.send_message(chat_id, json.dumps(card), msg_type="interactive")
+
+    @staticmethod
+    def _build_rag_answer_card(
+        answer: str,
+        question: str,
+        *,
+        feedback_state: str | None = None,
+        feedback_reason: str | None = None,
+    ) -> dict:
+        """Build the interactive card JSON for a RAG answer.
+
+        Args:
+            answer: The RAG answer markdown content.
+            question: The original question (truncated, stored in button value).
+            feedback_state: None (initial), "helpful", "not_helpful_ask", or "not_helpful_done".
+            feedback_reason: The reason text (when not_helpful_done).
+        """
+        elements: list[dict] = [
+            {"tag": "markdown", "content": answer},
+            {"tag": "hr"},
+        ]
+
+        # Truncate question for storage in button value (Feishu has value size limits)
+        q_short = question[:200] if question else ""
+
+        if feedback_state is None:
+            # Initial state: show feedback buttons
+            elements.append({
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "👍 有用"},
+                        "type": "primary",
+                        "value": {
+                            "action": "feedback_helpful",
+                            "question": q_short,
+                        },
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "👎 没用"},
+                        "type": "default",
+                        "value": {
+                            "action": "feedback_not_helpful",
+                            "question": q_short,
+                        },
+                    },
+                ],
+            })
+        elif feedback_state == "helpful":
+            elements.append({
+                "tag": "markdown",
+                "content": "👍 **感谢你的反馈！**",
+            })
+        elif feedback_state == "not_helpful_ask":
+            # Show form for reason input
+            elements.append({
+                "tag": "markdown",
+                "content": "👎 感谢反馈！如果方便，请告诉我们哪里可以改进：",
+            })
+            elements.append({
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "input",
+                        "name": "feedback_reason",
+                        "placeholder": {"tag": "plain_text", "content": "请输入原因（可选）"},
+                        "width": "fill",
+                    },
+                ],
+            })
+            elements.append({
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "提交"},
+                        "type": "primary",
+                        "value": {
+                            "action": "feedback_submit_reason",
+                            "question": q_short,
+                        },
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "跳过"},
+                        "type": "default",
+                        "value": {
+                            "action": "feedback_skip_reason",
+                            "question": q_short,
+                        },
+                    },
+                ],
+            })
+        elif feedback_state == "not_helpful_done":
+            reason_text = ""
+            if feedback_reason:
+                reason_text = f"\n原因：{feedback_reason}"
+            elements.append({
+                "tag": "markdown",
+                "content": f"👎 **感谢你的反馈，我们会持续改进！**{reason_text}",
+            })
+
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": "知识库回答"},
+                "template": "blue",
+            },
+            "elements": elements,
+        }
+        return card
+
+    def handle_card_action(self, card_action: Any) -> dict | None:
+        """Handle interactive card action callbacks (feedback buttons).
+
+        Returns a card dict to replace the current card, or None.
+        """
+        try:
+            action = card_action.action
+            action_value = action.get("value", {}) if isinstance(action, dict) else getattr(action, "value", {})
+            if isinstance(action_value, str):
+                action_value = json.loads(action_value)
+
+            action_type = action_value.get("action", "")
+            question = action_value.get("question", "")
+
+            # Get operator info
+            operator = card_action.operator
+            user_open_id = ""
+            if operator:
+                user_open_id = getattr(operator, "open_id", "") or ""
+
+            # Get the message_id of the card being interacted with
+            open_message_id = getattr(card_action, "open_message_id", "") or ""
+            # Get chat_id from the card action context
+            context = getattr(card_action, "context", None)
+            chat_id = ""
+            if context:
+                open_chat_id = getattr(context, "open_chat_id", "") or ""
+                chat_id = open_chat_id
+
+            # Read the existing answer from the card (to preserve it in updated card)
+            token = getattr(card_action, "token", "") or ""
+
+            # We need the original answer content from the card elements
+            card = getattr(card_action, "card", None)
+            answer_content = ""
+            if card:
+                elements = card.get("elements", []) if isinstance(card, dict) else []
+                for elem in elements:
+                    e = elem if isinstance(elem, dict) else {}
+                    if e.get("tag") == "markdown" and e.get("content", "").strip():
+                        answer_content = e["content"]
+                        break
+
+            # Get form input values (for reason submission)
+            form_value = action.get("form_value", {}) if isinstance(action, dict) else getattr(action, "form_value", {})
+            if isinstance(form_value, str):
+                form_value = json.loads(form_value) if form_value else {}
+            form_value = form_value or {}
+
+            if action_type == "feedback_helpful":
+                self._save_feedback(
+                    chat_id=chat_id,
+                    message_id=open_message_id,
+                    user_open_id=user_open_id,
+                    question=question,
+                    answer=answer_content,
+                    rating="helpful",
+                )
+                return self._build_rag_answer_card(
+                    answer_content, question, feedback_state="helpful",
+                )
+
+            elif action_type == "feedback_not_helpful":
+                # First save the not_helpful feedback (reason can be added later)
+                self._save_feedback(
+                    chat_id=chat_id,
+                    message_id=open_message_id,
+                    user_open_id=user_open_id,
+                    question=question,
+                    answer=answer_content,
+                    rating="not_helpful",
+                )
+                return self._build_rag_answer_card(
+                    answer_content, question, feedback_state="not_helpful_ask",
+                )
+
+            elif action_type == "feedback_submit_reason":
+                reason = form_value.get("feedback_reason", "")
+                self._update_feedback_reason(open_message_id, reason)
+                return self._build_rag_answer_card(
+                    answer_content, question,
+                    feedback_state="not_helpful_done",
+                    feedback_reason=reason,
+                )
+
+            elif action_type == "feedback_skip_reason":
+                return self._build_rag_answer_card(
+                    answer_content, question,
+                    feedback_state="not_helpful_done",
+                )
+
+        except Exception:
+            logger.exception("Error handling card action")
+        return None
+
+    @staticmethod
+    def _save_feedback(
+        *,
+        chat_id: str,
+        message_id: str,
+        user_open_id: str,
+        question: str,
+        answer: str,
+        rating: str,
+        reason: str | None = None,
+    ) -> None:
+        """Save feedback to the database."""
+        if not message_id:
+            logger.warning("Cannot save feedback: no message_id")
+            return
+        try:
+            with get_session() as session:
+                from sqlalchemy import select as sa_select
+                existing = session.execute(
+                    sa_select(ResponseFeedback.id).where(
+                        ResponseFeedback.message_id == message_id,
+                    )
+                ).scalar_one_or_none()
+                if existing:
+                    return  # Already recorded
+                session.add(ResponseFeedback(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    user_open_id=user_open_id or None,
+                    question=question or None,
+                    answer=answer or None,
+                    rating=rating,
+                    reason=reason,
+                ))
+        except Exception:
+            logger.exception("Failed to save feedback for message %s", message_id)
+
+    @staticmethod
+    def _update_feedback_reason(message_id: str, reason: str) -> None:
+        """Update the reason field for an existing feedback record."""
+        if not message_id or not reason:
+            return
+        try:
+            with get_session() as session:
+                from sqlalchemy import update as sa_update
+                session.execute(
+                    sa_update(ResponseFeedback).where(
+                        ResponseFeedback.message_id == message_id,
+                    ).values(reason=reason)
+                )
+        except Exception:
+            logger.exception("Failed to update feedback reason for message %s", message_id)
 
     def fetch_history_messages(self, chat_id: str, page_size: int = 50) -> list[dict[str, Any]]:
         """Fetch historical messages from a chat for compensation."""

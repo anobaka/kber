@@ -204,6 +204,31 @@ class SummarizeTaskLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
 
 
+class ResponseFeedback(Base):
+    __tablename__ = "response_feedback"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    chat_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    message_id: Mapped[str] = mapped_column(
+        String(100), nullable=False, unique=True,
+        comment="Feishu message_id of the answer card",
+    )
+    user_open_id: Mapped[Optional[str]] = mapped_column(String(100))
+    question: Mapped[Optional[str]] = mapped_column(Text)
+    answer: Mapped[Optional[str]] = mapped_column(Text)
+    rating: Mapped[str] = mapped_column(
+        Enum("helpful", "not_helpful", name="feedback_rating_enum"),
+        nullable=False,
+    )
+    reason: Mapped[Optional[str]] = mapped_column(Text, comment="Optional reason when rated not_helpful")
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("idx_feedback_chat", "chat_id"),
+        Index("idx_feedback_rating", "rating"),
+    )
+
+
 class SummarizeErrorLog(Base):
     __tablename__ = "summarize_error_log"
 
