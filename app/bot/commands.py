@@ -707,28 +707,28 @@ class CommandRouter:
         self.bot.send_message(chat_id, f"✅ 已移除用户 `{user_id}` 的管理员权限。")
 
     def _show_help(self, chat_id: str) -> None:
-        help_text = """📖 **可用命令 / Available Commands：**
+        help_text = """📖 **可用命令：**
 
-**绑定知识库 / bind-kb** {名称}　— 将本群聊天记录纳入指定知识库 / Bind this chat to a knowledge base
-**解绑知识库 / unbind-kb** {名称}　— 解除本群与知识库的绑定 / Unbind this chat from a knowledge base
-**绑定代码库 / bind-repo** {org/repo 或 URL}　— 关联代码库并自动分析 / Bind a code repo and start analysis
-**解绑代码库 / unbind-repo** {org/repo 或 URL}　— 解除代码库关联 / Unbind a code repo
-**添加知识 / add-knowledge** [知识库名称] {内容}　— 手动添加知识 / Manually add knowledge
-**我的ID / myid**　— 获取你的用户 ID / Get your user ID
-**帮助 / help**　— 显示本帮助信息 / Show this help message
+**绑定知识库 / bind-kb** {名称}　— 将本群聊天记录纳入指定知识库
+**解绑知识库 / unbind-kb** {名称}　— 解除本群与知识库的绑定
+**绑定代码库 / bind-repo** {org/repo 或 URL}　— 关联代码库并自动分析
+**解绑代码库 / unbind-repo** {org/repo 或 URL}　— 解除代码库关联
+**添加知识 / add-knowledge** [知识库名称] {内容}　— 手动添加知识
+**我的ID / myid**　— 获取你的用户 ID
+**帮助 / help**　— 显示本帮助信息
 
-🔒 **管理员命令 / Admin Commands：**
-**立即总结 / summarize**　— 立即触发知识归纳任务 / Trigger summarization now
-**重建知识库 / rebuild-kb** {名称}　— 清除并重建指定知识库 / Rebuild a knowledge base
-**停止构建 / stop-build** {名称}　— 停止正在构建的知识库任务 / Stop an ongoing build task
-**恢复构建 / resume-build** {名称}　— 恢复中断的构建任务 / Resume an interrupted build task
-**查询知识库 / list-kb**　— 查看所有知识库状态 / List all knowledge bases
-**添加管理员 / add-admin** {用户ID}　— 添加管理员 / Add an admin user
-**移除管理员 / remove-admin** {用户ID}　— 移除管理员 / Remove an admin user
-**enable-debug**　— 开启本群 Debug 模式 / Enable debug mode
-**disable-debug**　— 关闭本群 Debug 模式 / Disable debug mode
+🔒 **管理员命令：**
+**立即总结 / summarize**　— 立即触发知识归纳任务
+**重建知识库 / rebuild-kb** {名称}　— 清除并重建指定知识库
+**停止构建 / stop-build** {名称}　— 停止正在构建的知识库任务
+**恢复构建 / resume-build** {名称}　— 恢复中断的构建任务
+**查询知识库 / list-kb**　— 查看所有知识库状态
+**添加管理员 / add-admin** {用户ID}　— 添加管理员
+**移除管理员 / remove-admin** {用户ID}　— 移除管理员
+**enable-debug**　— 开启本群 Debug 模式
+**disable-debug**　— 关闭本群 Debug 模式
 
-💬 直接提问即可查询知识库 / Ask any question to query the knowledge base"""
+💬 直接提问即可查询知识库"""
         self.bot.send_card(chat_id, "帮助", help_text)
 
     def _rag_query(self, chat_id: str, sender_id: str, question: str) -> None:
@@ -736,7 +736,7 @@ class CommandRouter:
             return
         self.bot.send_message(chat_id, "🔍 正在检索知识库...")
         answer = rag_service.answer(chat_id, question, sender_id=sender_id)
-        self.bot.send_message(chat_id, answer)
+        self.bot.send_message(chat_id, answer, msg_type="post")
 
     # ------------------------------------------------------------------
     # Helpers
