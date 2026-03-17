@@ -32,6 +32,7 @@ class FeishuBot:
     def __init__(self) -> None:
         self._client: lark.Client | None = None
         self._ws_client: Any = None
+        self._bot_open_id: str | None = None
         self._seen_msg_ids: collections.OrderedDict[str, None] = collections.OrderedDict()
         self._seen_lock = threading.Lock()
 
@@ -45,10 +46,34 @@ class FeishuBot:
                 .build()
         return self._client
 
+    def _fetch_bot_open_id(self) -> str | None:
+        """Fetch the bot's own open_id via Feishu API (bot info endpoint)."""
+        try:
+            resp = self.client.request.request(
+                lark.RawRequest.builder()
+                .http_method("GET")
+                .uri("/open-apis/bot/v3/info")
+                .build()
+            )
+            if resp.success():
+                import json as _json
+                data = _json.loads(resp.raw.content)
+                open_id = data.get("bot", {}).get("open_id", "")
+                if open_id:
+                    logger.info("Bot open_id: %s", open_id)
+                    return open_id
+            logger.warning("Failed to fetch bot info: %s", getattr(resp, "msg", ""))
+        except Exception:
+            logger.exception("Failed to fetch bot open_id")
+        return None
+
     def start(self, message_handler: Any) -> None:
         """Start the WebSocket long connection to receive messages."""
         from app.bot.commands import CommandRouter
         from app.services.debug_notifier import set_send_fn, set_send_progress_fn, set_update_fn
+
+        # Fetch bot's own open_id for @mention detection
+        self._bot_open_id = self._fetch_bot_open_id()
 
         # Register send/update functions for debug notifications
         set_send_fn(self.send_message)
@@ -101,11 +126,21 @@ class FeishuBot:
             content_json = json.loads(content_str) if content_str else {}
             text = content_json.get("text", "").strip()
 
-            # Check if bot is mentioned (for group chats)
+            # Check if bot is specifically mentioned (for group chats)
             mentions = msg.mentions or []
-            is_at_bot = len(mentions) > 0
+            is_at_bot = False
+            for m in mentions:
+                # Match by open_id if available, otherwise fall back to
+                # checking if any mention exists (legacy behaviour).
+                mention_id = getattr(getattr(m, "id", None), "open_id", None) or getattr(m, "id", None)
+                if self._bot_open_id and mention_id == self._bot_open_id:
+                    is_at_bot = True
+                elif not self._bot_open_id:
+                    # Fallback: if we couldn't fetch bot open_id, treat
+                    # any mention as bot mention (same as before).
+                    is_at_bot = True
 
-            # Remove @bot mention from text
+            # Remove @mention placeholders from text
             for m in mentions:
                 if m.key:
                     text = text.replace(m.key, "").strip()
@@ -116,7 +151,7 @@ class FeishuBot:
                 # This is a command or question directed at the bot
                 router.handle(chat_id, message_id, sender_id, text)
             else:
-                # This is a regular group message – collect for knowledge base
+                # Regular group message (including @others) – collect for knowledge base
                 self._collect_message(chat_id, message_id, sender_id, text, msg_type, parent_id)
 
         except Exception:
