@@ -1124,23 +1124,37 @@ class RepoAnalyzer:
 
         Before inserting, delete old Milvus entries for the same blocks
         (identified by file_path) to avoid duplicates.
-        """
-        total_entries = len(entries)
 
-        # --- Phase 1: Clean old Milvus entries ---
-        file_paths = {e["block"]["file_path"] for e in entries}
-        if notify_fn:
-            notify_fn(
-                f"💾 正在清理旧向量（{len(file_paths)} 个文件）...",
-                progress=True,
-            )
-        for fpath in file_paths:
+        Progress is reported as a single 0-100% across three phases:
+        clean (10%), embed (70%), write (20%).
+        """
+        # Weighted phase boundaries: clean 0-10%, embed 10-80%, write 80-100%
+        PHASE_CLEAN_END = 10
+        PHASE_EMBED_END = 80
+
+        throttle = _ProgressThrottle(100, pct_step=2)
+
+        def _progress(pct: int) -> None:
+            if not notify_fn:
+                return
+            if not throttle.should_notify(pct):
+                return
+            eta = throttle.eta(pct)
+            eta_part = f"，预计{eta}" if eta else ""
+            notify_fn(f"💾 正在写入（{pct}%{eta_part}）...", progress=True)
+
+        _progress(0)
+
+        # --- Phase 1: Clean old Milvus entries (0% ~ 10%) ---
+        file_paths = list({e["block"]["file_path"] for e in entries})
+        for idx, fpath in enumerate(file_paths):
             try:
                 milvus_service.delete_by_expr(
                     kb_id, f'file_path == "{fpath}" and block_type != "module_summary" and block_type != "repo_summary"',
                 )
             except Exception as e:
                 logger.warning("Failed to clean old block knowledge for %s: %s", fpath, e)
+            _progress((idx + 1) * PHASE_CLEAN_END // len(file_paths))
 
         # --- Phase 2: Split long descriptions into segments ---
         expanded: list[tuple[dict[str, Any], str]] = []  # (entry, segment)
@@ -1153,21 +1167,17 @@ class RepoAnalyzer:
             else:
                 expanded.append((entry, desc))
 
-        # --- Phase 3: Batch embedding ---
+        # --- Phase 3: Batch embedding (10% ~ 80%) ---
         texts = [seg for _, seg in expanded]
-        if notify_fn:
-            notify_fn(
-                f"💾 正在生成向量（{len(texts)} 段文本）...",
-                progress=True,
-            )
-        vectors = embedding_service.embed_batch(texts)
 
-        # --- Phase 4: Write to Milvus ---
-        if notify_fn:
-            notify_fn(
-                f"💾 正在写入 Milvus（{total_entries} 个代码块）...",
-                progress=True,
-            )
+        def _embed_progress(done: int, total: int) -> None:
+            pct = PHASE_CLEAN_END + done * (PHASE_EMBED_END - PHASE_CLEAN_END) // total
+            _progress(pct)
+
+        vectors = embedding_service.embed_batch(texts, progress_fn=_embed_progress)
+
+        # --- Phase 4: Write to Milvus (80% ~ 100%) ---
+        _progress(PHASE_EMBED_END)
         milvus_entries: list[dict[str, Any]] = []
         for vec, (entry, seg) in zip(vectors, expanded):
             block = entry["block"]

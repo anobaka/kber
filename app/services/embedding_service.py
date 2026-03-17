@@ -1,7 +1,10 @@
 """Embedding service using OpenAI-compatible API."""
 
+from __future__ import annotations
+
 import logging
 import time
+from typing import Callable
 
 from openai import OpenAI
 
@@ -30,9 +33,19 @@ class EmbeddingService:
         """Embed a single text string."""
         return self.embed_batch([text])[0]
 
-    def embed_batch(self, texts: list[str], batch_size: int = 10) -> list[list[float]]:
-        """Embed a batch of texts, handling API limits."""
+    def embed_batch(
+        self,
+        texts: list[str],
+        batch_size: int = 10,
+        progress_fn: "Callable[[int, int], None] | None" = None,
+    ) -> list[list[float]]:
+        """Embed a batch of texts, handling API limits.
+
+        ``progress_fn(done, total)`` is called after each micro-batch
+        completes so callers can report progress.
+        """
         all_vectors: list[list[float]] = []
+        total = len(texts)
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
             for attempt in range(3):
@@ -51,6 +64,8 @@ class EmbeddingService:
                         time.sleep(wait)
                     else:
                         raise
+            if progress_fn:
+                progress_fn(min(i + batch_size, total), total)
         return all_vectors
 
 
