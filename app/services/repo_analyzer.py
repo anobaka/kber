@@ -1127,14 +1127,18 @@ class RepoAnalyzer:
 
         # --- Phase 1: Clean old Milvus entries (0% ~ 10%) ---
         file_paths = list({e["block"]["file_path"] for e in entries})
-        for idx, fpath in enumerate(file_paths):
-            try:
-                milvus_service.delete_by_expr(
-                    kb_id, f'file_path == "{fpath}" and block_type != "module_summary" and block_type != "repo_summary"',
-                )
-            except Exception as e:
-                logger.warning("Failed to clean old block knowledge for %s: %s", fpath, e)
-            _progress((idx + 1) * PHASE_CLEAN_END // len(file_paths))
+        try:
+            escaped = [fp.replace('"', '\\"') for fp in file_paths]
+            in_list = ", ".join(f'"{fp}"' for fp in escaped)
+            milvus_service.delete_by_expr(
+                kb_id,
+                f'file_path in [{in_list}]'
+                f' and block_type != "module_summary"'
+                f' and block_type != "repo_summary"',
+            )
+        except Exception as e:
+            logger.warning("Failed to clean old block knowledge: %s", e)
+        _progress(PHASE_CLEAN_END)
 
         # --- Phase 2: Split long descriptions into segments ---
         expanded: list[tuple[dict[str, Any], str]] = []  # (entry, segment)
