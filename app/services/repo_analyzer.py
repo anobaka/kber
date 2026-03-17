@@ -73,7 +73,7 @@ SENSITIVE_PATTERNS = [
 
 LANG_MAP: dict[str, str] = {
     ".py": "python", ".js": "javascript", ".jsx": "javascript",
-    ".ts": "typescript", ".tsx": "typescript", ".java": "java",
+    ".ts": "typescript", ".tsx": "tsx", ".java": "java",
     ".go": "go", ".rs": "rust", ".c": "c", ".h": "c", ".cpp": "cpp",
     ".cs": "c_sharp", ".rb": "ruby", ".php": "php",
     ".swift": "swift", ".kt": "kotlin", ".scala": "scala",
@@ -545,6 +545,9 @@ class RepoAnalyzer:
         except Exception:
             return []
         source = _redact_sensitive(source)
+        if not source.strip():
+            logger.debug("Skipping empty file: %s", rel_path)
+            return []
         if lang:
             blocks = self._parse_with_treesitter(source, lang, rel_path, repo_id)
             if blocks:
@@ -576,6 +579,8 @@ class RepoAnalyzer:
                 import tree_sitter_javascript; return tree_sitter_javascript.language()
             elif lang == "typescript":
                 import tree_sitter_typescript; return tree_sitter_typescript.language_typescript()
+            elif lang == "tsx":
+                import tree_sitter_typescript; return tree_sitter_typescript.language_tsx()
             elif lang == "java":
                 import tree_sitter_java; return tree_sitter_java.language()
             elif lang == "go":
@@ -885,11 +890,24 @@ class RepoAnalyzer:
                             fpath, block_label,
                         )
 
-                if not code:
-                    raise ValueError(
-                        f"Empty code block (file_exists={os.path.exists(os.path.join(repo_dir, block['file_path']))}, "
-                        f"is_retry={is_retry})"
+                if not code or not code.strip():
+                    # Empty code block — no point retrying, mark as permanently failed
+                    logger.info(
+                        "Skipping empty code block [%s] (file_exists=%s, is_retry=%s)",
+                        block_label,
+                        os.path.exists(os.path.join(repo_dir, block["file_path"])),
+                        is_retry,
                     )
+                    if cb_id:
+                        with get_session() as session:
+                            session.execute(
+                                update(CodeBlock).where(CodeBlock.id == cb_id).values(
+                                    status="failed",
+                                    error_message="Empty code block — skipped permanently",
+                                    retry_count=MAX_BLOCK_RETRY,  # prevent further retries
+                                )
+                            )
+                    return None
 
                 description = llm_service.generate_code_knowledge(
                     repo_map=repo_map,
