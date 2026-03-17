@@ -85,6 +85,8 @@ class CommandRouter:
         ("重建知识库", "rebuild-kb", "_rebuild_kb"),
         ("停止构建", "stop-build", "_stop_build"),
         ("恢复构建", "resume-build", "_resume_build"),
+        ("添加管理员", "add-admin", "_add_admin"),
+        ("移除管理员", "remove-admin", "_remove_admin"),
     ]
 
     # Commands that must match exactly (no parameter).
@@ -660,6 +662,47 @@ class CommandRouter:
         status = "已开启" if enabled else "已关闭"
         self.bot.send_message(chat_id, f"✅ 本群 Debug 模式{status}。")
 
+    def _add_admin(self, chat_id: str, sender_id: str, user_id: str) -> None:
+        if not self._is_admin(sender_id):
+            self.bot.send_message(chat_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
+            return
+        if not user_id:
+            self.bot.send_message(chat_id, "⚠️ 请提供用户 ID，格式：添加管理员 {用户ID} / add-admin {user_id}")
+            return
+
+        with get_session() as session:
+            existing = session.execute(
+                select(AdminUser).where(AdminUser.sender_id == user_id)
+            ).scalar_one_or_none()
+            if existing:
+                self.bot.send_message(chat_id, f"ℹ️ 用户 `{user_id}` 已经是管理员。")
+                return
+            session.add(AdminUser(sender_id=user_id))
+
+        self.bot.send_message(chat_id, f"✅ 已将用户 `{user_id}` 添加为管理员。")
+
+    def _remove_admin(self, chat_id: str, sender_id: str, user_id: str) -> None:
+        if not self._is_admin(sender_id):
+            self.bot.send_message(chat_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
+            return
+        if not user_id:
+            self.bot.send_message(chat_id, "⚠️ 请提供用户 ID，格式：移除管理员 {用户ID} / remove-admin {user_id}")
+            return
+        if user_id == sender_id:
+            self.bot.send_message(chat_id, "⚠️ 不能移除自己的管理员权限。")
+            return
+
+        with get_session() as session:
+            admin = session.execute(
+                select(AdminUser).where(AdminUser.sender_id == user_id)
+            ).scalar_one_or_none()
+            if not admin:
+                self.bot.send_message(chat_id, f"ℹ️ 用户 `{user_id}` 不是管理员。")
+                return
+            session.delete(admin)
+
+        self.bot.send_message(chat_id, f"✅ 已移除用户 `{user_id}` 的管理员权限。")
+
     def _show_help(self, chat_id: str) -> None:
         help_text = """📖 **可用命令 / Available Commands：**
 
@@ -677,6 +720,8 @@ class CommandRouter:
 **停止构建 / stop-build** {名称}　— 停止正在构建的知识库任务 / Stop an ongoing build task
 **恢复构建 / resume-build** {名称}　— 恢复中断的构建任务 / Resume an interrupted build task
 **查询知识库 / list-kb**　— 查看所有知识库状态 / List all knowledge bases
+**添加管理员 / add-admin** {用户ID}　— 添加管理员 / Add an admin user
+**移除管理员 / remove-admin** {用户ID}　— 移除管理员 / Remove an admin user
 **enable-debug**　— 开启本群 Debug 模式 / Enable debug mode
 **disable-debug**　— 关闭本群 Debug 模式 / Disable debug mode
 
