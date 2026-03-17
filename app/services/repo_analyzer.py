@@ -347,8 +347,6 @@ class RepoAnalyzer:
             # interrupted run (status='generated') — skip LLM, go straight
             # to embedding + Milvus write.
             cached_entries = self._load_generated_blocks(repo_id, current_commit)
-            if cached_entries:
-                _notify(f"♻️ 恢复 {len(cached_entries)} 个已缓存的代码块描述，跳过 LLM 生成", progress=True)
 
             if blocks_to_generate:
                 success_entries, failed_count = self._generate_block_knowledge(
