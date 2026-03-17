@@ -89,12 +89,17 @@ class MilvusService:
         col = self.ensure_collection(kb_id)
         now_ts = int(time.time())
 
-        # Truncate varchar fields to schema limits
-        topics = [t[:200] for t in topics]
-        contents = [c[:5000] for c in contents]
-        sources = [s[:50] for s in sources]
-        source_details = [sd[:500] for sd in source_details]
-        certainties = [c[:20] for c in certainties]
+        # Truncate varchar fields to schema byte limits
+        def _trunc(val: str, limit: int) -> str:
+            while len(val.encode("utf-8")) > limit:
+                val = val[: len(val) - 1]
+            return val
+
+        topics = [_trunc(t, 200) for t in topics]
+        contents = [_trunc(c, 5000) for c in contents]
+        sources = [_trunc(s, 50) for s in sources]
+        source_details = [_trunc(sd, 500) for sd in source_details]
+        certainties = [_trunc(c, 20) for c in certainties]
 
         data = [
             vectors,
@@ -143,10 +148,13 @@ class MilvusService:
             entry.setdefault("kb_id", kb_id)
             entry.setdefault("last_updated_at", now_ts)
             entry.setdefault("last_referenced_at", now_ts)
-            # Truncate varchar fields to schema limits
+            # Truncate varchar fields to schema byte limits
             for field, limit in self._VARCHAR_LIMITS.items():
-                if field in entry and isinstance(entry[field], str) and len(entry[field]) > limit:
-                    entry[field] = entry[field][:limit]
+                if field in entry and isinstance(entry[field], str):
+                    val = entry[field]
+                    while len(val.encode("utf-8")) > limit:
+                        val = val[: len(val) - 1]
+                    entry[field] = val
 
         result = col.insert(entries)
         col.flush()
