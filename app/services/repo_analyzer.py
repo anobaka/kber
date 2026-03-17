@@ -265,7 +265,7 @@ class RepoAnalyzer:
             # Step 2: Scan & filter files
             # ----------------------------------------------------------
             _check()
-            _notify("🔍 正在扫描文件...", progress=True)
+            _notify("🔍 正在扫描代码库...", progress=True)
 
             all_files = self._scan_files(repo_dir)
             if changed_files is not None:
@@ -277,7 +277,7 @@ class RepoAnalyzer:
                 files_to_process = all_files
 
             total_files = len(files_to_process)
-            _notify("✅ 文件扫描完成", progress=True, done=True)
+            _notify("✅ 扫描完成", progress=True, done=True)
 
             # ----------------------------------------------------------
             # Step 3: AST parse → code blocks
@@ -291,13 +291,13 @@ class RepoAnalyzer:
                     pct = (i + 1) * 100 // total_files
                     eta = parse_throttle.eta(i + 1)
                     eta_part = f"，预计{eta}" if eta else ""
-                    _notify(f"🔍 正在解析代码结构（{pct}%{eta_part}）...", progress=True)
+                    _notify(f"🔍 正在解析（{pct}%{eta_part}）...", progress=True)
                 blocks = self._parse_file(fpath, repo_dir, repo_id)
                 new_blocks.extend(blocks)
                 stats["files_parsed"] += 1
 
             if total_files:
-                _notify("✅ 代码结构解析完成", progress=True, done=True)
+                _notify("✅ 解析完成", progress=True, done=True)
 
             # ----------------------------------------------------------
             # Step 4: Upsert code_block records, detect what needs LLM
@@ -310,7 +310,7 @@ class RepoAnalyzer:
             # Repair orphaned blocks (success in DB but missing from Milvus)
             repaired = self._repair_orphaned_blocks(repo_id, kb_id)
             if repaired:
-                _notify(f"🔧 发现 {repaired} 个孤儿代码块（之前中断导致），已重置为待处理", progress=True)
+                logger.info("Repaired %d orphaned blocks for repo %d", repaired, repo_id)
 
             # Also pick up failed / orphaned-pending blocks from previous runs
             existing_cb_ids = {b["_cb_id"] for b in blocks_to_generate if b.get("_cb_id")}
@@ -365,7 +365,7 @@ class RepoAnalyzer:
             # Write all entries to Milvus (batch embedding)
             if all_entries:
                 self._store_block_knowledge(kb_id, all_entries, notify_fn=_notify)
-                _notify("✅ 代码块知识写入完成", progress=True, done=True)
+                _notify("✅ 存储完成", progress=True, done=True)
 
             # Always advance commit hash (file-level checkpoint)
             self._update_repo_commit(repo_id, current_commit)
@@ -378,7 +378,7 @@ class RepoAnalyzer:
                 repo_id, blocks_to_generate, changed_files,
             )
             if affected_dirs:
-                _notify(f"📝 正在更新 {len(affected_dirs)} 个模块摘要...", progress=True)
+                _notify("📝 正在更新摘要...", progress=True)
                 updated = self._regenerate_module_summaries(
                     kb_id, repo_id, affected_dirs, repo_map, _notify,
                     check_cancelled_fn=_check,
@@ -390,51 +390,33 @@ class RepoAnalyzer:
             # ----------------------------------------------------------
             _check()
             if blocks_to_generate or affected_dirs:
-                _notify("📋 正在更新仓库概览...", progress=True)
+                _notify("📋 正在生成概览...", progress=True)
                 try:
                     self._regenerate_repo_overview(kb_id, repo_id, repo_map)
-                    _notify("✅ 仓库概览更新完成", progress=True, done=True)
+                    _notify("✅ 概览生成完成", progress=True, done=True)
                 except Exception:
                     logger.exception("Failed to regenerate repo overview for repo %d", repo_id)
-                    _notify("⚠️ 仓库概览更新失败", progress=True, done=True)
+                    _notify("⚠️ 概览生成失败", progress=True, done=True)
 
             self._finish_task_log(task_log_id, "success", stats)
 
-            summary_parts = [
-                f"共解析 {stats['files_parsed']} 个文件",
-                f"生成 {stats['knowledge_generated']} 条代码知识",
-            ]
-            if stats["blocks_failed"]:
-                summary_parts.append(
-                    f"{stats['blocks_failed']} 个代码块失败"
-                    f"（将在下次重试，最多 {MAX_BLOCK_RETRY} 次）"
-                )
-            if stats["blocks_permanently_failed"]:
-                summary_parts.append(
-                    f"{stats['blocks_permanently_failed']} 个代码块已永久失败（超过最大重试次数）"
-                )
-            if stats["modules_updated"]:
-                summary_parts.append(f"更新 {stats['modules_updated']} 个模块摘要")
+            logger.info(
+                "Repo analysis succeeded for repo_id=%d: %s", repo_id, stats,
+            )
             clear_progress_msg("repo", repo_id)
-            _notify(f"✅ 代码库分析完成！{'，'.join(summary_parts)}。")
+            _notify("✅ 代码库分析完成！")
 
         except CancelledError:
             logger.info("Repo analysis cancelled for repo_id=%d", repo_id)
             self._finish_task_log(task_log_id, "failed", stats, "用户取消")
             clear_progress_msg("repo", repo_id)
-            _notify(
-                f"🛑 代码库分析已停止。"
-                f"已完成：{stats['files_parsed']} 个文件解析，{stats['knowledge_generated']} 条知识。"
-            )
+            _notify("🛑 代码库分析已停止。")
 
         except Exception as e:
             logger.exception("Repo analysis failed for repo_id=%d", repo_id)
             self._finish_task_log(task_log_id, "failed", stats, str(e))
             clear_progress_msg("repo", repo_id)
-            _notify(
-                f"⚠️ 代码库分析失败：{str(e)[:100]}，"
-                f"已成功处理 {stats['files_parsed']}/{total_files} 个文件。"
-            )
+            _notify("⚠️ 代码库分析失败，请重试。")
 
         return stats
 
@@ -1105,10 +1087,10 @@ class RepoAnalyzer:
                     pct = done_count * 100 // total
                     eta = throttle.eta(done_count)
                     eta_part = f"，预计{eta}" if eta else ""
-                    notify_fn(f"🤖 正在生成知识摘要（{pct}%{eta_part}）...", progress=True)
+                    notify_fn(f"🤖 正在分析（{pct}%{eta_part}）...", progress=True)
 
         if notify_fn and total:
-            notify_fn("✅ 知识摘要生成完成", progress=True, done=True)
+            notify_fn("✅ 分析完成", progress=True, done=True)
 
         return entries, failed
 
@@ -1139,7 +1121,7 @@ class RepoAnalyzer:
                 return
             eta = throttle.eta(pct)
             eta_part = f"，预计{eta}" if eta else ""
-            notify_fn(f"💾 正在写入（{pct}%{eta_part}）...", progress=True)
+            notify_fn(f"💾 正在存储（{pct}%{eta_part}）...", progress=True)
 
         _progress(0)
 
@@ -1330,10 +1312,10 @@ class RepoAnalyzer:
                     pct = done_count * 100 // len(dirs_list)
                     eta = throttle.eta(done_count)
                     eta_part = f"，预计{eta}" if eta else ""
-                    notify_fn(f"📝 正在更新模块摘要（{pct}%{eta_part}）...", progress=True)
+                    notify_fn(f"📝 正在更新摘要（{pct}%{eta_part}）...", progress=True)
 
         if notify_fn and dirs_list:
-            notify_fn("✅ 模块摘要更新完成", progress=True, done=True)
+            notify_fn("✅ 摘要更新完成", progress=True, done=True)
 
         return updated
 

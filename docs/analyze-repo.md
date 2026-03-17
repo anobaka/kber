@@ -22,12 +22,22 @@
 
 ### 块级进度追踪与错误恢复
 
-每个代码块在 `code_block` 表中有 `status` 字段（pending / success / failed）和 `content_hash` 字段（代码内容的 SHA-256）。
+每个代码块在 `code_block` 表中有 `status` 字段（pending / generated / success / failed）、`content_hash`（代码内容的 SHA-256）和 `description`（LLM 生成的知识描述）。
+
+状态流转：
+
+```
+pending → (LLM 生成) → generated → (Embedding + 向量库写入) → success
+  ↑                                                           ↓ (失败)
+  └─────────────────── failed ←───────────────────────────────┘
+```
 
 - AST 解析后立即将所有代码块 upsert 到 `code_block` 表（status=pending）
-- LLM 成功后标记为 success，失败后标记为 failed 并记录 error_message
-- 下次执行时，**除了处理 diff 出的新变更文件**，还会**重试所有 status=failed 的旧块**
-- `content_hash` 用于跳过代码内容未变化且已成功的块，避免重复调用 LLM
+- LLM 生成描述后立即持久化到 `description` 字段并标记 `generated`，确保进程中断后不丢失 LLM 结果
+- Embedding + 向量库写入成功后标记 `success`
+- 失败时标记 `failed` 并记录 error_message，`retry_count` 递增，超过上限后不再重试
+- 下次执行时，`generated` 的块跳过 LLM 直接进入 Embedding 阶段；`failed` 的块自动重试
+- `content_hash` 用于跳过代码内容未变化且已完成（success/generated）的块，避免重复调用 LLM
 - commit hash 仅作为文件级增量检查点，块级恢复由 code_block 状态驱动
 
 ### 变更级联
@@ -274,7 +284,8 @@ src/
 
 - **Git 操作失败**：记录错误，不影响其他仓库的处理。commit hash 不推进。
 - **AST 解析失败**：跳过解析失败的文件，记录日志。部分语言的语法扩展可能不被 Tree-sitter 支持。
-- **LLM 调用失败（代码块）**：标记 `code_block.status=failed`，记录错误原因。**下次定时任务自动重试**。commit hash 仍然推进（文件级检查点），块级恢复由 status 驱动。
+- **LLM 调用失败（代码块）**：标记 `code_block.status=failed`，记录错误原因，`retry_count` 递增。**下次定时任务自动重试**（超过最大重试次数后不再重试）。commit hash 仍然推进（文件级检查点），块级恢复由 status 驱动。
+- **进程中断恢复**：LLM 生成的描述在写入向量库前已持久化到 `code_block.description`（status=generated）。重启后自动跳过 LLM 调用，直接进入 Embedding 阶段。标记为 success 但向量库中缺失数据的孤儿块会被自动检测并修复。
 - **LLM 调用失败（模块摘要/仓库概览）**：记录警告日志，不阻塞整体流程。仓库概览生成失败时仍会发送完成/失败通知。下次有块变更时会重新触发。
 - **Milvus 写入失败**：记录警告日志，该文件的知识在下次变更时重新生成。
 - **部分成功场景**：例如 500 个块中 50 个失败，450 个的知识正常写入 Milvus，50 个标记 failed 等待重试。模块摘要基于已成功的块生成（不等待全部成功）。
