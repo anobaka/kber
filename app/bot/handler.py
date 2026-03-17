@@ -302,30 +302,37 @@ class FeishuBot:
 
     @staticmethod
     def _build_progress_card(text: str) -> str:
-        """Build a minimal card JSON for progress notifications."""
+        """Build a minimal card JSON 2.0 for progress notifications."""
         card = {
+            "schema": "2.0",
             "config": {"wide_screen_mode": True},
-            "elements": [
-                {"tag": "markdown", "content": text},
-            ],
-        }
-        return json.dumps(card)
-
-    def send_card(self, chat_id: str, title: str, content: str) -> None:
-        """Send a rich-text post message with Markdown rendering.
-
-        Uses Feishu ``post`` msg_type with the ``md`` tag for full
-        Markdown support (bold, italic, code blocks, lists, links, etc.).
-        """
-        post = {
-            "zh_cn": {
-                "title": title,
-                "content": [
-                    [{"tag": "md", "text": content}],
+            "body": {
+                "elements": [
+                    {"tag": "markdown", "content": text, "text_size": "normal"},
                 ],
             },
         }
-        self.send_message(chat_id, json.dumps(post), msg_type="post")
+        return json.dumps(card)
+
+    def send_card(self, chat_id: str, title: str, content: str) -> str | None:
+        """Send an interactive card with JSON 2.0 Markdown rendering.
+
+        Returns the message_id on success.
+        """
+        card = {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": title},
+                "template": "blue",
+            },
+            "body": {
+                "elements": [
+                    {"tag": "markdown", "content": content, "text_size": "normal"},
+                ],
+            },
+        }
+        return self.send_message(chat_id, json.dumps(card), msg_type="interactive")
 
     def send_rag_answer_card(
         self,
@@ -348,7 +355,7 @@ class FeishuBot:
         feedback_state: str | None = None,
         feedback_reason: str | None = None,
     ) -> dict:
-        """Build the interactive card JSON for a RAG answer.
+        """Build the interactive card JSON 2.0 for a RAG answer.
 
         Args:
             answer: The RAG answer markdown content.
@@ -357,7 +364,12 @@ class FeishuBot:
             feedback_reason: The reason text (when not_helpful_done).
         """
         elements: list[dict] = [
-            {"tag": "markdown", "content": answer},
+            {
+                "tag": "markdown",
+                "content": answer,
+                "text_size": "normal",
+                "margin": "0px 0px 8px 0px",
+            },
             {"tag": "hr"},
         ]
 
@@ -393,12 +405,16 @@ class FeishuBot:
             elements.append({
                 "tag": "markdown",
                 "content": "👍 **感谢你的反馈！**",
+                "text_size": "notation",
+                "margin": "4px 0px 0px 0px",
             })
         elif feedback_state == "not_helpful_ask":
             # Show form for reason input
             elements.append({
                 "tag": "markdown",
                 "content": "👎 感谢反馈！如果方便，请告诉我们哪里可以改进：",
+                "text_size": "normal",
+                "margin": "4px 0px 0px 0px",
             })
             elements.append({
                 "tag": "action",
@@ -441,15 +457,20 @@ class FeishuBot:
             elements.append({
                 "tag": "markdown",
                 "content": f"👎 **感谢你的反馈，我们会持续改进！**{reason_text}",
+                "text_size": "notation",
+                "margin": "4px 0px 0px 0px",
             })
 
         card = {
+            "schema": "2.0",
             "config": {"wide_screen_mode": True},
             "header": {
                 "title": {"tag": "plain_text", "content": "知识库回答"},
                 "template": "blue",
             },
-            "elements": elements,
+            "body": {
+                "elements": elements,
+            },
         }
         return card
 
@@ -486,10 +507,15 @@ class FeishuBot:
             token = getattr(card_action, "token", "") or ""
 
             # We need the original answer content from the card elements
+            # Support both JSON 2.0 (body.elements) and 1.0 (elements) structures
             card = getattr(card_action, "card", None)
             answer_content = ""
-            if card:
-                elements = card.get("elements", []) if isinstance(card, dict) else []
+            if card and isinstance(card, dict):
+                body = card.get("body", {})
+                elements = (
+                    body.get("elements", []) if isinstance(body, dict) and body
+                    else card.get("elements", [])
+                )
                 for elem in elements:
                     e = elem if isinstance(elem, dict) else {}
                     if e.get("tag") == "markdown" and e.get("content", "").strip():
