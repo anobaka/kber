@@ -25,7 +25,7 @@ logging.basicConfig(
 # File handler – 10 MB per file, keep 5 backups
 _file_handler = RotatingFileHandler(
     os.path.join(LOG_DIR, "kber.log"),
-    maxBytes=10 * 1024 * 1024,
+    maxBytes=100 * 1024 * 1024,
     backupCount=5,
     encoding="utf-8",
 )
