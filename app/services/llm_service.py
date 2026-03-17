@@ -162,15 +162,21 @@ class LLMService:
             {"role": "user", "content": prompt},
         ])
 
-    def rag_answer(self, context: str, question: str) -> str:
+    def rag_answer(self, context: str, question: str, *, history: str = "") -> str:
         """Generate an answer based on RAG context."""
+        history_section = ""
+        if history:
+            history_section = f"""
+## 对话历史
+{history}
+
+"""
         prompt = f"""你是一个企业知识库助手。请根据以下参考资料回答用户的问题。
 如果参考资料中没有相关信息，请明确告知用户你无法回答，不要编造答案。
 
 ## 参考资料
 {context}
-
-## 用户问题
+{history_section}## 用户问题
 {question}
 
 ## 回答要求

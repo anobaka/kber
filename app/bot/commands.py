@@ -124,6 +124,8 @@ class CommandRouter:
             if user_id:
                 id_msg += f"\n你的工号：`{user_id}`"
             self.bot.send_message(chat_id, id_msg)
+        elif text.lower() in ("清空上下文", "clear-context"):
+            self._clear_context(chat_id)
         elif text.lower() in ("帮助", "help"):
             self._show_help(chat_id)
         else:
@@ -706,6 +708,10 @@ class CommandRouter:
 
         self.bot.send_message(chat_id, f"✅ 已移除用户 `{user_id}` 的管理员权限。")
 
+    def _clear_context(self, chat_id: str) -> None:
+        rag_service.clear_context(chat_id)
+        self.bot.send_message(chat_id, "✅ 已清空对话上下文，下次提问将不携带历史记录。")
+
     def _show_help(self, chat_id: str) -> None:
         help_text = """📖 **可用命令：**
 
@@ -714,6 +720,7 @@ class CommandRouter:
 **绑定代码库 / bind-repo** {org/repo 或 URL}　— 关联代码库并自动分析
 **解绑代码库 / unbind-repo** {org/repo 或 URL}　— 解除代码库关联
 **添加知识 / add-knowledge** [知识库名称] {内容}　— 手动添加知识
+**清空上下文 / clear-context**　— 清空对话上下文，下次提问不携带历史记录
 **我的ID / myid**　— 获取你的用户 ID
 **帮助 / help**　— 显示本帮助信息
 

@@ -89,6 +89,13 @@ class MilvusService:
         col = self.ensure_collection(kb_id)
         now_ts = int(time.time())
 
+        # Truncate varchar fields to schema limits
+        topics = [t[:200] for t in topics]
+        contents = [c[:5000] for c in contents]
+        sources = [s[:50] for s in sources]
+        source_details = [sd[:500] for sd in source_details]
+        certainties = [c[:20] for c in certainties]
+
         data = [
             vectors,
             topics,
@@ -114,6 +121,15 @@ class MilvusService:
         logger.info("Inserted %d entries into kb_%d", len(vectors), kb_id)
         return result.primary_keys
 
+    # Max lengths matching the collection schema varchar fields.
+    _VARCHAR_LIMITS: dict[str, int] = {
+        "topic": 200,
+        "content": 5000,
+        "source": 50,
+        "source_detail": 500,
+        "certainty": 20,
+    }
+
     def insert_knowledge_dicts(
         self,
         kb_id: int,
@@ -127,6 +143,10 @@ class MilvusService:
             entry.setdefault("kb_id", kb_id)
             entry.setdefault("last_updated_at", now_ts)
             entry.setdefault("last_referenced_at", now_ts)
+            # Truncate varchar fields to schema limits
+            for field, limit in self._VARCHAR_LIMITS.items():
+                if field in entry and isinstance(entry[field], str) and len(entry[field]) > limit:
+                    entry[field] = entry[field][:limit]
 
         result = col.insert(entries)
         col.flush()

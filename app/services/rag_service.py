@@ -1,6 +1,8 @@
 """RAG (Retrieval-Augmented Generation) service for knowledge-based Q&A."""
 
 import logging
+import threading
+from collections import deque
 from typing import Any
 
 from sqlalchemy import select
@@ -14,9 +16,24 @@ from app.services.security_service import check_input, sanitize_output
 
 logger = logging.getLogger(__name__)
 
+# Per-chat conversation history for multi-turn context.
+# Key: chat_id → deque of (question, answer) tuples (max 5 rounds).
+_chat_history: dict[str, deque[tuple[str, str]]] = {}
+_history_lock = threading.Lock()
+
+# Chats that requested a one-time context clear.
+_clear_next: set[str] = set()
+
+_MAX_HISTORY = 5
+
 
 class RAGService:
     """Handles RAG-based Q&A pipeline."""
+
+    def clear_context(self, chat_id: str) -> None:
+        """Clear conversation history for the next @mention in a chat."""
+        with _history_lock:
+            _clear_next.add(chat_id)
 
     def answer(self, chat_id: str, question: str, sender_id: str | None = None) -> str:
         """Full RAG pipeline: security check → retrieve → generate answer."""
@@ -71,13 +88,34 @@ class RAGService:
         # Build context
         context = self._build_context(top_hits)
 
+        # Build conversation history (skip if cleared)
+        history_text = ""
+        with _history_lock:
+            should_clear = chat_id in _clear_next
+            if should_clear:
+                _clear_next.discard(chat_id)
+                _chat_history.pop(chat_id, None)
+            else:
+                history = _chat_history.get(chat_id)
+                if history:
+                    parts = []
+                    for q, a in history:
+                        parts.append(f"用户：{q}\n助手：{a}")
+                    history_text = "\n\n".join(parts)
+
         # Generate answer
         try:
-            answer = llm_service.rag_answer(context, question)
+            answer = llm_service.rag_answer(context, question, history=history_text)
             answer = sanitize_output(answer)
         except Exception as e:
             logger.error("RAG answer generation failed: %s", e)
             return "⚠️ 生成回答时出错，请稍后再试。"
+
+        # Store in conversation history
+        with _history_lock:
+            if chat_id not in _chat_history:
+                _chat_history[chat_id] = deque(maxlen=_MAX_HISTORY)
+            _chat_history[chat_id].append((question, answer))
 
         return answer
 
