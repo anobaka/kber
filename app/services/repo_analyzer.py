@@ -885,16 +885,27 @@ class RepoAnalyzer:
             except Exception as e:
                 logger.warning("Failed to clean old block knowledge for %s: %s", fpath, e)
 
-        texts = [e["description"] for e in entries]
+        # Split long descriptions into segments via LLM, then embed all at once.
+        expanded: list[tuple[dict[str, Any], str]] = []  # (entry, segment)
+        for entry in entries:
+            desc = entry["description"]
+            if len(desc) > 4500:
+                segments = llm_service.split_long_content(desc, max_length=4500)
+                for seg in segments:
+                    expanded.append((entry, seg))
+            else:
+                expanded.append((entry, desc))
+
+        texts = [seg for _, seg in expanded]
         vectors = embedding_service.embed_batch(texts)
 
         milvus_entries: list[dict[str, Any]] = []
-        for vec, entry in zip(vectors, entries):
+        for vec, (entry, seg) in zip(vectors, expanded):
             block = entry["block"]
             milvus_entries.append({
                 "vector": vec,
                 "topic": f"{block['file_path']}:{block.get('block_name', '')}",
-                "content": entry["description"][:5000],
+                "content": seg,
                 "source": "code",
                 "source_detail": f"{block['file_path']}:{block.get('start_line', 0)}-{block.get('end_line', 0)}",
                 "certainty": "confirmed",
@@ -987,11 +998,15 @@ class RepoAnalyzer:
                 except Exception:
                     pass
 
-                vec = embedding_service.embed(summary)
-                milvus_service.insert_knowledge_dicts(kb_id, [{
-                    "vector": vec,
+                segments = llm_service.split_long_content(summary, max_length=4500)
+                seg_texts = segments
+                seg_vecs = embedding_service.embed_batch(seg_texts) if len(seg_texts) > 1 else [embedding_service.embed(seg_texts[0])]
+                seg_entries = []
+                for sv, st in zip(seg_vecs, seg_texts):
+                    seg_entries.append({
+                    "vector": sv,
                     "topic": f"模块摘要：{module_dir}",
-                    "content": summary[:5000],
+                    "content": st,
                     "source": "code",
                     "source_detail": f"module:{module_dir}",
                     "certainty": "confirmed",
@@ -1003,7 +1018,8 @@ class RepoAnalyzer:
                     "block_type": "module_summary",
                     "block_name": module_dir,
                     "commit_hash": "",
-                }])
+                    })
+                milvus_service.insert_knowledge_dicts(kb_id, seg_entries)
                 return True
 
             except Exception as e:
@@ -1096,23 +1112,27 @@ class RepoAnalyzer:
             except Exception:
                 pass
 
-            vec = embedding_service.embed(overview)
-            milvus_service.insert_knowledge_dicts(kb_id, [{
-                "vector": vec,
-                "topic": "仓库全局概览",
-                "content": overview[:5000],
-                "source": "code",
-                "source_detail": "repo:overview",
-                "certainty": "confirmed",
-                "kb_id": kb_id,
-                "last_updated_at": int(time.time()),
-                "last_referenced_at": int(time.time()),
-                "file_path": ".",
-                "language": "",
-                "block_type": "repo_summary",
-                "block_name": "overview",
-                "commit_hash": "",
-            }])
+            segments = llm_service.split_long_content(overview, max_length=4500)
+            seg_vecs = embedding_service.embed_batch(segments) if len(segments) > 1 else [embedding_service.embed(segments[0])]
+            overview_entries = []
+            for sv, st in zip(seg_vecs, segments):
+                overview_entries.append({
+                    "vector": sv,
+                    "topic": "仓库全局概览",
+                    "content": st,
+                    "source": "code",
+                    "source_detail": "repo:overview",
+                    "certainty": "confirmed",
+                    "kb_id": kb_id,
+                    "last_updated_at": int(time.time()),
+                    "last_referenced_at": int(time.time()),
+                    "file_path": ".",
+                    "language": "",
+                    "block_type": "repo_summary",
+                    "block_name": "overview",
+                    "commit_hash": "",
+                })
+            milvus_service.insert_knowledge_dicts(kb_id, overview_entries)
 
         except Exception as e:
             logger.warning("Failed to generate repo overview: %s", e)

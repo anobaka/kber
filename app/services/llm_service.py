@@ -245,6 +245,46 @@ class LLMService:
             {"role": "user", "content": prompt},
         ], max_tokens=4096)
 
+    def split_long_content(self, content: str, max_length: int = 4500) -> list[str]:
+        """Split long content into semantically coherent segments using LLM.
+
+        Each segment will be under *max_length* characters. If the content is
+        already within the limit, it is returned as-is in a single-element list.
+        """
+        if len(content) <= max_length:
+            return [content]
+
+        prompt = f"""请将以下长文本拆分为多个语义完整的片段。
+
+## 要求
+1. 每个片段不超过 {max_length} 个字符
+2. 在逻辑边界处拆分（如不同功能模块、不同主题之间）
+3. 每个片段应当语义独立，能被单独理解
+4. 用 "---SPLIT---" 标记分隔每个片段
+5. 不要添加额外的说明文字，只输出分段后的内容
+
+## 原文
+{content}"""
+        try:
+            result = self.chat([
+                {"role": "system", "content": "你是一个文本处理专家。"},
+                {"role": "user", "content": prompt},
+            ], max_tokens=max(4096, len(content) // 2))
+            segments = [s.strip() for s in result.split("---SPLIT---") if s.strip()]
+            # Safety: if LLM produced segments still too long, hard-truncate
+            final: list[str] = []
+            for seg in segments:
+                if len(seg) <= max_length:
+                    final.append(seg)
+                else:
+                    # Fallback: split at max_length boundaries
+                    for i in range(0, len(seg), max_length):
+                        final.append(seg[i:i + max_length])
+            return final if final else [content[:max_length]]
+        except Exception:
+            logger.warning("LLM split failed, falling back to hard split")
+            return [content[i:i + max_length] for i in range(0, len(content), max_length)]
+
     def merge_knowledge(self, knowledge_a: str, knowledge_b: str) -> str:
         """Merge two similar knowledge entries into one."""
         prompt = f"""请将以下两条相似的知识合并为一条更精炼的知识：
