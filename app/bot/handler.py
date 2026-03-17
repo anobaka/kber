@@ -8,12 +8,17 @@ from typing import Any
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
+    CreateMessageReactionRequest,
+    CreateMessageReactionRequestBody,
     CreateMessageRequest,
     CreateMessageRequestBody,
+    Emoji,
     GetChatRequest,
     ListMessageRequest,
     PatchMessageRequest,
     PatchMessageRequestBody,
+    ReplyMessageRequest,
+    ReplyMessageRequestBody,
 )
 from lark_oapi.event.callback.model.p2_card_action_trigger import (
     P2CardActionTrigger,
@@ -635,6 +640,89 @@ class FeishuBot:
                 )
         except Exception:
             logger.exception("Failed to update feedback reason for message %s", message_id)
+
+    def add_reaction(self, message_id: str, emoji_type: str = "OneSecond") -> bool:
+        """Add an emoji reaction to a message.
+
+        Args:
+            message_id: The ID of the message to react to
+            emoji_type: The emoji type (e.g., "OneSecond", "THUMBS_UP", "OK", "HEART")
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            request = CreateMessageReactionRequest.builder() \
+                .message_id(message_id) \
+                .request_body(
+                    CreateMessageReactionRequestBody.builder()
+                    .reaction_type(
+                        Emoji.builder()
+                        .emoji_type(emoji_type)
+                        .build()
+                    )
+                    .build()
+                ) \
+                .build()
+
+            response = self.client.im.v1.message_reaction.create(request)
+            if not response.success():
+                logger.error("Failed to add reaction to %s: %s", message_id, response.msg)
+                return False
+            logger.debug("Added reaction %s to message %s", emoji_type, message_id)
+            return True
+        except Exception:
+            logger.exception("Failed to add reaction to %s", message_id)
+            return False
+
+    def reply_message(
+        self,
+        message_id: str,
+        content: str,
+        msg_type: str = "text",
+        reply_in_thread: bool = False,
+    ) -> str | None:
+        """Reply to a specific message.
+
+        Args:
+            message_id: The ID of the message to reply to
+            content: The message content
+            msg_type: Message type ("text", "post", "interactive")
+            reply_in_thread: Whether to reply in thread (True) or as a direct reply (False)
+
+        Returns:
+            The new message_id on success, None otherwise
+        """
+        try:
+            # Build content based on msg_type
+            if msg_type == "text":
+                content_json = json.dumps({"text": content})
+            elif msg_type == "post":
+                content_json = content  # Already JSON
+            elif msg_type == "interactive":
+                content_json = content  # Already JSON
+            else:
+                content_json = json.dumps({"text": content})
+
+            request = ReplyMessageRequest.builder() \
+                .message_id(message_id) \
+                .request_body(
+                    ReplyMessageRequestBody.builder()
+                    .content(content_json)
+                    .msg_type(msg_type)
+                    .reply_in_thread(reply_in_thread)
+                    .build()
+                ) \
+                .build()
+
+            response = self.client.im.v1.message.reply(request)
+            if not response.success():
+                logger.error("Failed to reply to message %s: %s", message_id, response.msg)
+                return None
+            return response.data.message_id if response.data else None
+        except Exception:
+            logger.exception("Failed to reply to message %s", message_id)
+            return None
 
     def fetch_history_messages(self, chat_id: str, page_size: int = 50) -> list[dict[str, Any]]:
         """Fetch historical messages from a chat for compensation."""
