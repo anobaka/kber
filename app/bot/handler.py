@@ -15,9 +15,13 @@ from lark_oapi.api.im.v1 import (
     PatchMessageRequest,
     PatchMessageRequestBody,
 )
+from lark_oapi.event.callback.model.p2_card_action_trigger import (
+    P2CardActionTrigger,
+    P2CardActionTriggerResponse,
+)
 
 from app.config import config
-from app.db.models import ChatMessage
+from app.db.models import ChatMessage, ResponseFeedback
 from app.db.session import get_session
 
 logger = logging.getLogger(__name__)
@@ -95,6 +99,7 @@ class FeishuBot:
             .register_p2_im_message_receive_v1(
                 lambda event: self._on_message(None, event, router)
             ) \
+            .register_p2_card_action_trigger(self._on_card_action) \
             .build()
 
         self._ws_client = lark.ws.Client(
@@ -295,30 +300,341 @@ class FeishuBot:
 
     @staticmethod
     def _build_progress_card(text: str) -> str:
-        """Build a minimal card JSON for progress notifications."""
+        """Build a minimal card JSON 2.0 for progress notifications."""
         card = {
+            "schema": "2.0",
             "config": {"wide_screen_mode": True},
-            "elements": [
-                {"tag": "markdown", "content": text},
-            ],
-        }
-        return json.dumps(card)
-
-    def send_card(self, chat_id: str, title: str, content: str) -> None:
-        """Send a rich-text post message with Markdown rendering.
-
-        Uses Feishu ``post`` msg_type with the ``md`` tag for full
-        Markdown support (bold, italic, code blocks, lists, links, etc.).
-        """
-        post = {
-            "zh_cn": {
-                "title": title,
-                "content": [
-                    [{"tag": "md", "text": content}],
+            "body": {
+                "elements": [
+                    {"tag": "markdown", "content": text, "text_size": "normal"},
                 ],
             },
         }
-        self.send_message(chat_id, json.dumps(post), msg_type="post")
+        return json.dumps(card)
+
+    def send_card(self, chat_id: str, title: str, content: str) -> str | None:
+        """Send an interactive card with JSON 2.0 Markdown rendering.
+
+        Returns the message_id on success.
+        """
+        card = {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": title},
+                "template": "blue",
+            },
+            "body": {
+                "elements": [
+                    {"tag": "markdown", "content": content, "text_size": "normal"},
+                ],
+            },
+        }
+        return self.send_message(chat_id, json.dumps(card), msg_type="interactive")
+
+    def send_rag_answer_card(
+        self,
+        chat_id: str,
+        question: str,
+        answer: str,
+    ) -> str | None:
+        """Send an interactive card with the RAG answer and feedback buttons.
+
+        Returns the message_id of the sent card for feedback tracking.
+        """
+        card = self._build_rag_answer_card(answer, question)
+        return self.send_message(chat_id, json.dumps(card), msg_type="interactive")
+
+    @staticmethod
+    def _build_rag_answer_card(
+        answer: str,
+        question: str,
+        *,
+        feedback_state: str | None = None,
+        feedback_reason: str | None = None,
+    ) -> dict:
+        """Build the interactive card JSON 2.0 for a RAG answer.
+
+        Args:
+            answer: The RAG answer markdown content.
+            question: The original question (truncated, stored in button value).
+            feedback_state: None (initial), "helpful", "not_helpful_ask", or "not_helpful_done".
+            feedback_reason: The reason text (when not_helpful_done).
+        """
+        elements: list[dict] = [
+            {
+                "tag": "markdown",
+                "content": answer,
+                "text_size": "normal",
+                "margin": "0px 0px 8px 0px",
+            },
+            {"tag": "hr"},
+        ]
+
+        # Truncate question/answer for storage in button value (Feishu has value size limits).
+        # Answer is stored in the value so the callback can rebuild the card
+        # (P2CardActionTrigger does not include the original card content).
+        q_short = question[:200] if question else ""
+        a_short = answer[:1500] if answer else ""
+
+        # Common callback value payload for buttons
+        _cb_base = {"question": q_short, "answer": a_short}
+
+        if feedback_state is None:
+            # Initial state: two feedback buttons side by side via column_set
+            elements.append({
+                "tag": "column_set",
+                "flex_mode": "flow",
+                "columns": [
+                    {
+                        "tag": "column",
+                        "width": "auto",
+                        "weight": 1,
+                        "elements": [{
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "👍 有用"},
+                            "type": "primary",
+                            "behaviors": [{"type": "callback", "value": {**_cb_base, "action": "feedback_helpful"}}],
+                        }],
+                    },
+                    {
+                        "tag": "column",
+                        "width": "auto",
+                        "weight": 1,
+                        "elements": [{
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "👎 没用"},
+                            "type": "default",
+                            "behaviors": [{"type": "callback", "value": {**_cb_base, "action": "feedback_not_helpful"}}],
+                        }],
+                    },
+                ],
+            })
+        elif feedback_state == "helpful":
+            elements.append({
+                "tag": "markdown",
+                "content": "👍 **感谢你的反馈！**",
+                "text_size": "notation",
+                "margin": "4px 0px 0px 0px",
+            })
+        elif feedback_state == "not_helpful_ask":
+            # Show form for reason input + submit/skip buttons
+            elements.append({
+                "tag": "markdown",
+                "content": "👎 感谢反馈！如果方便，请告诉我们哪里可以改进：",
+                "text_size": "normal",
+                "margin": "4px 0px 0px 0px",
+            })
+            elements.append({
+                "tag": "form_container",
+                "name": "feedback_form",
+                "elements": [
+                    {
+                        "tag": "input",
+                        "name": "feedback_reason",
+                        "placeholder": {"tag": "plain_text", "content": "请输入原因（可选）"},
+                        "width": "fill",
+                    },
+                    {
+                        "tag": "column_set",
+                        "flex_mode": "flow",
+                        "columns": [
+                            {
+                                "tag": "column",
+                                "width": "auto",
+                                "weight": 1,
+                                "elements": [{
+                                    "tag": "button",
+                                    "text": {"tag": "plain_text", "content": "提交"},
+                                    "type": "primary",
+                                    "name": "submit_btn",
+                                    "form_action_type": "submit",
+                                    "behaviors": [{"type": "callback", "value": {**_cb_base, "action": "feedback_submit_reason"}}],
+                                }],
+                            },
+                            {
+                                "tag": "column",
+                                "width": "auto",
+                                "weight": 1,
+                                "elements": [{
+                                    "tag": "button",
+                                    "text": {"tag": "plain_text", "content": "跳过"},
+                                    "type": "default",
+                                    "name": "skip_btn",
+                                    "form_action_type": "submit",
+                                    "behaviors": [{"type": "callback", "value": {**_cb_base, "action": "feedback_skip_reason"}}],
+                                }],
+                            },
+                        ],
+                    },
+                ],
+            })
+        elif feedback_state == "not_helpful_done":
+            reason_text = ""
+            if feedback_reason:
+                reason_text = f"\n原因：{feedback_reason}"
+            elements.append({
+                "tag": "markdown",
+                "content": f"👎 **感谢你的反馈，我们会持续改进！**{reason_text}",
+                "text_size": "notation",
+                "margin": "4px 0px 0px 0px",
+            })
+
+        card = {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": "知识库回答"},
+                "template": "blue",
+            },
+            "body": {
+                "elements": elements,
+            },
+        }
+        return card
+
+    def _on_card_action(self, data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
+        """SDK callback for card action events (registered via register_p2_card_action_trigger)."""
+        card_data = self._handle_card_action(data)
+        if card_data is None:
+            return P2CardActionTriggerResponse({})
+        return P2CardActionTriggerResponse({
+            "card": {
+                "type": "raw",
+                "data": card_data,
+            },
+        })
+
+    def _handle_card_action(self, data: P2CardActionTrigger) -> dict | None:
+        """Process card action and return an updated card dict, or None."""
+        try:
+            event = data.event
+            if not event:
+                return None
+
+            action = event.action
+            if not action:
+                return None
+
+            action_value = action.value or {}
+            action_type = action_value.get("action", "")
+            question = action_value.get("question", "")
+
+            # Operator info
+            operator = event.operator
+            user_open_id = operator.open_id if operator else ""
+
+            # Message and chat context
+            ctx = event.context
+            open_message_id = ctx.open_message_id if ctx else ""
+            chat_id = ctx.open_chat_id if ctx else ""
+
+            # Extract the original answer from the card to preserve in the updated card.
+            # The card content is not available in P2CardActionTrigger, so we look it up
+            # from the feedback record or fall back to fetching via API.
+            # For simplicity, we store the answer in the button value alongside the question.
+            answer_content = action_value.get("answer", "")
+
+            # Form input values (for reason submission)
+            form_value = action.form_value or {}
+
+            if action_type == "feedback_helpful":
+                self._save_feedback(
+                    chat_id=chat_id,
+                    message_id=open_message_id,
+                    user_open_id=user_open_id,
+                    question=question,
+                    answer=answer_content,
+                    rating="helpful",
+                )
+                return self._build_rag_answer_card(
+                    answer_content, question, feedback_state="helpful",
+                )
+
+            elif action_type == "feedback_not_helpful":
+                self._save_feedback(
+                    chat_id=chat_id,
+                    message_id=open_message_id,
+                    user_open_id=user_open_id,
+                    question=question,
+                    answer=answer_content,
+                    rating="not_helpful",
+                )
+                return self._build_rag_answer_card(
+                    answer_content, question, feedback_state="not_helpful_ask",
+                )
+
+            elif action_type == "feedback_submit_reason":
+                reason = form_value.get("feedback_reason", "")
+                self._update_feedback_reason(open_message_id, reason)
+                return self._build_rag_answer_card(
+                    answer_content, question,
+                    feedback_state="not_helpful_done",
+                    feedback_reason=reason,
+                )
+
+            elif action_type == "feedback_skip_reason":
+                return self._build_rag_answer_card(
+                    answer_content, question,
+                    feedback_state="not_helpful_done",
+                )
+
+        except Exception:
+            logger.exception("Error handling card action")
+        return None
+
+    @staticmethod
+    def _save_feedback(
+        *,
+        chat_id: str,
+        message_id: str,
+        user_open_id: str,
+        question: str,
+        answer: str,
+        rating: str,
+        reason: str | None = None,
+    ) -> None:
+        """Save feedback to the database."""
+        if not message_id:
+            logger.warning("Cannot save feedback: no message_id")
+            return
+        try:
+            with get_session() as session:
+                from sqlalchemy import select as sa_select
+                existing = session.execute(
+                    sa_select(ResponseFeedback.id).where(
+                        ResponseFeedback.message_id == message_id,
+                    )
+                ).scalar_one_or_none()
+                if existing:
+                    return  # Already recorded
+                session.add(ResponseFeedback(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    user_open_id=user_open_id or None,
+                    question=question or None,
+                    answer=answer or None,
+                    rating=rating,
+                    reason=reason,
+                ))
+        except Exception:
+            logger.exception("Failed to save feedback for message %s", message_id)
+
+    @staticmethod
+    def _update_feedback_reason(message_id: str, reason: str) -> None:
+        """Update the reason field for an existing feedback record."""
+        if not message_id or not reason:
+            return
+        try:
+            with get_session() as session:
+                from sqlalchemy import update as sa_update
+                session.execute(
+                    sa_update(ResponseFeedback).where(
+                        ResponseFeedback.message_id == message_id,
+                    ).values(reason=reason)
+                )
+        except Exception:
+            logger.exception("Failed to update feedback reason for message %s", message_id)
 
     def fetch_history_messages(self, chat_id: str, page_size: int = 50) -> list[dict[str, Any]]:
         """Fetch historical messages from a chat for compensation."""
