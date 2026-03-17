@@ -57,6 +57,8 @@ BLACKLIST_DIRS = {
     ".pytest_cache", "venv", ".venv", "env",
 }
 
+MAX_BLOCK_RETRY = 3  # Maximum number of retries for failed blocks
+
 MAX_FILE_SIZE = 100 * 1024  # 100KB
 MAX_LINE_LENGTH = 500
 
@@ -184,8 +186,8 @@ class RepoAnalyzer:
 
         stats: dict[str, int] = {
             "files_parsed": 0, "blocks_found": 0, "blocks_success": 0,
-            "blocks_failed": 0, "knowledge_generated": 0,
-            "modules_updated": 0,
+            "blocks_failed": 0, "blocks_permanently_failed": 0,
+            "knowledge_generated": 0, "modules_updated": 0,
         }
 
         with get_session() as session:
@@ -305,9 +307,28 @@ class RepoAnalyzer:
                 repo_id, new_blocks, current_commit, changed_files,
             )
 
-            # Also pick up failed blocks from previous runs for retry
-            retry_blocks = self._load_failed_blocks(repo_id)
+            # Also pick up failed / orphaned-pending blocks from previous runs
+            existing_cb_ids = {b["_cb_id"] for b in blocks_to_generate if b.get("_cb_id")}
+            retry_blocks = self._load_failed_blocks(repo_id, exclude_ids=existing_cb_ids)
             blocks_to_generate.extend(retry_blocks)
+
+            # Count permanently failed blocks (exceeded max retry)
+            with get_session() as session:
+                perm_failed = session.execute(
+                    select(CodeBlock).where(
+                        CodeBlock.repo_id == repo_id,
+                        CodeBlock.status == "failed",
+                        CodeBlock.retry_count >= MAX_BLOCK_RETRY,
+                    )
+                ).scalars().all()
+                stats["blocks_permanently_failed"] = len(perm_failed)
+                if perm_failed:
+                    for pf in perm_failed:
+                        logger.warning(
+                            "Block permanently failed (retry_count=%d): %s:%s (lines %s-%s) — %s",
+                            pf.retry_count, pf.file_path, pf.block_name,
+                            pf.start_line, pf.end_line, pf.error_message,
+                        )
 
             stats["blocks_found"] = len(new_blocks) + len(retry_blocks)
 
@@ -370,7 +391,14 @@ class RepoAnalyzer:
                 f"生成 {stats['knowledge_generated']} 条代码知识",
             ]
             if stats["blocks_failed"]:
-                summary_parts.append(f"{stats['blocks_failed']} 个代码块失败（将在下次重试）")
+                summary_parts.append(
+                    f"{stats['blocks_failed']} 个代码块失败"
+                    f"（将在下次重试，最多 {MAX_BLOCK_RETRY} 次）"
+                )
+            if stats["blocks_permanently_failed"]:
+                summary_parts.append(
+                    f"{stats['blocks_permanently_failed']} 个代码块已永久失败（超过最大重试次数）"
+                )
             if stats["modules_updated"]:
                 summary_parts.append(f"更新 {stats['modules_updated']} 个模块摘要")
             clear_progress_msg("repo", repo_id)
@@ -716,18 +744,35 @@ class RepoAnalyzer:
 
         return blocks_needing_llm
 
-    def _load_failed_blocks(self, repo_id: int) -> list[dict[str, Any]]:
-        """Load previously failed blocks for retry."""
-        with get_session() as session:
-            rows = session.execute(
-                select(CodeBlock).where(
-                    CodeBlock.repo_id == repo_id,
-                    CodeBlock.status == "failed",
-                )
-            ).scalars().all()
+    def _load_failed_blocks(
+        self, repo_id: int, exclude_ids: set[int] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Load previously failed or orphaned pending blocks for retry.
 
+        Blocks with ``status='failed'`` are always loaded (up to MAX_BLOCK_RETRY).
+        Blocks with ``status='pending'`` are also loaded — these represent blocks
+        from interrupted previous runs that were never completed.
+
+        ``exclude_ids`` should contain ``_cb_id`` values of blocks already queued
+        for generation by ``_sync_code_blocks`` in this run, to avoid duplicates.
+        """
+        with get_session() as session:
+            query = select(CodeBlock).where(
+                CodeBlock.repo_id == repo_id,
+                CodeBlock.status.in_(["failed", "pending"]),
+                CodeBlock.retry_count < MAX_BLOCK_RETRY,
+            )
+            if exclude_ids:
+                query = query.where(CodeBlock.id.notin_(exclude_ids))
+
+            rows = session.execute(query).scalars().all()
+
+            skipped = 0
             blocks: list[dict[str, Any]] = []
             for row in rows:
+                if row.retry_count >= MAX_BLOCK_RETRY:
+                    skipped += 1
+                    continue
                 blocks.append({
                     "file_path": row.file_path,
                     "language": LANG_MAP.get(os.path.splitext(row.file_path)[1].lower(), ""),
@@ -741,7 +786,23 @@ class RepoAnalyzer:
                     "repo_id": repo_id,
                     "_cb_id": row.id,
                     "_is_retry": True,
+                    "_retry_count": row.retry_count,
                 })
+
+            if skipped:
+                logger.info(
+                    "Skipped %d blocks that exceeded max retry count (%d) for repo %d",
+                    skipped, MAX_BLOCK_RETRY, repo_id,
+                )
+            if blocks:
+                logger.info(
+                    "Loaded %d blocks for retry (failed=%d, pending=%d) for repo %d",
+                    len(blocks),
+                    sum(1 for r in rows if r.status == "failed" and r.retry_count < MAX_BLOCK_RETRY),
+                    sum(1 for r in rows if r.status == "pending" and r.retry_count < MAX_BLOCK_RETRY),
+                    repo_id,
+                )
+
             return blocks
 
     def _mark_block_success(self, cb_id: int, milvus_id: str | None = None) -> None:
@@ -756,7 +817,9 @@ class RepoAnalyzer:
         with get_session() as session:
             session.execute(
                 update(CodeBlock).where(CodeBlock.id == cb_id).values(
-                    status="failed", error_message=error[:500],
+                    status="failed",
+                    error_message=error[:500],
+                    retry_count=CodeBlock.retry_count + 1,
                 )
             )
 
@@ -802,10 +865,12 @@ class RepoAnalyzer:
 
         def process_block(block: dict[str, Any]) -> dict[str, Any] | None:
             cb_id = block.get("_cb_id")
+            block_label = f"{block.get('file_path')}:{block.get('block_name', '?')} (lines {block.get('start_line')}-{block.get('end_line')})"
+            is_retry = block.get("_is_retry", False)
             try:
                 # For retry blocks, re-read code from file
                 code = block.get("code", "")
-                if not code and block.get("_is_retry"):
+                if not code and is_retry:
                     fpath = os.path.join(repo_dir, block["file_path"])
                     if os.path.exists(fpath):
                         with open(fpath, "r", errors="ignore") as f:
@@ -814,9 +879,17 @@ class RepoAnalyzer:
                         start = (block.get("start_line") or 1) - 1
                         end = block.get("end_line") or len(source.split("\n"))
                         code = "\n".join(source.split("\n")[start:end])
+                    else:
+                        logger.warning(
+                            "Block retry failed - file not found: %s (block: %s)",
+                            fpath, block_label,
+                        )
 
                 if not code:
-                    raise ValueError("Empty code block")
+                    raise ValueError(
+                        f"Empty code block (file_exists={os.path.exists(os.path.join(repo_dir, block['file_path']))}, "
+                        f"is_retry={is_retry})"
+                    )
 
                 description = llm_service.generate_code_knowledge(
                     repo_map=repo_map,
@@ -827,9 +900,8 @@ class RepoAnalyzer:
                     code=code[:8000],
                 )
 
-                if cb_id:
-                    self._mark_block_success(cb_id)
-
+                # NOTE: Do not mark success here — mark after Milvus write
+                # to avoid orphaned blocks if the process is interrupted.
                 return {
                     "block": block,
                     "description": description,
@@ -838,8 +910,12 @@ class RepoAnalyzer:
             except CancelledError:
                 raise
             except Exception as e:
-                logger.warning("Failed to generate knowledge for %s:%s: %s",
-                               block.get("file_path"), block.get("block_name"), e)
+                retry_info = f" (retry #{block.get('_retry_count', 0) + 1}/{MAX_BLOCK_RETRY})" if is_retry else ""
+                logger.warning(
+                    "Failed to generate knowledge for block [%s]%s: %s",
+                    block_label, retry_info, e,
+                    exc_info=True,
+                )
                 if cb_id:
                     self._mark_block_failed(cb_id, str(e))
                 return None
@@ -920,6 +996,19 @@ class RepoAnalyzer:
             })
 
         milvus_service.insert_knowledge_dicts(kb_id, milvus_entries)
+
+        # Mark blocks as "success" AFTER Milvus write completes.
+        # This prevents orphaned blocks (marked success but not in Milvus)
+        # when the process is interrupted between LLM generation and Milvus write.
+        success_cb_ids = [e["block"]["_cb_id"] for e in entries if e["block"].get("_cb_id")]
+        if success_cb_ids:
+            with get_session() as session:
+                session.execute(
+                    update(CodeBlock)
+                    .where(CodeBlock.id.in_(success_cb_ids))
+                    .values(status="success", error_message=None)
+                )
+            logger.info("Marked %d blocks as success after Milvus write", len(success_cb_ids))
 
     # ================================================================== #
     #  Module-level summaries                                              #
