@@ -34,8 +34,8 @@ class Config:
     LLM_API_KEY: str = os.getenv("LLM_API_KEY", "")
     LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
     LLM_MODEL: str = os.getenv("LLM_MODEL", "minimax-m2.5")
-    LLM_TIMEOUT: int = int(os.getenv("LLM_TIMEOUT", "30"))
-    LLM_MAX_RETRIES: int = int(os.getenv("LLM_MAX_RETRIES", "2"))
+    LLM_TIMEOUT: int = int(os.getenv("LLM_TIMEOUT", "120"))
+    LLM_MAX_RETRIES: int = int(os.getenv("LLM_MAX_RETRIES", "3"))
 
     # --- Embedding ---
     EMBEDDING_API_KEY: str = os.getenv("EMBEDDING_API_KEY", "")

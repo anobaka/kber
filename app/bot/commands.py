@@ -736,7 +736,7 @@ class CommandRouter:
             return
         self.bot.send_message(chat_id, "🔍 正在检索知识库...")
         answer = rag_service.answer(chat_id, question, sender_id=sender_id)
-        self.bot.send_message(chat_id, answer, msg_type="post")
+        self.bot.send_card(chat_id, "知识库回答", answer)
 
     # ------------------------------------------------------------------
     # Helpers

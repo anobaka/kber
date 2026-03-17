@@ -22,7 +22,7 @@ class EmbeddingService:
             self._client = OpenAI(
                 api_key=config.EMBEDDING_API_KEY or config.LLM_API_KEY,
                 base_url=config.EMBEDDING_BASE_URL,
-                timeout=30,
+                timeout=config.LLM_TIMEOUT,
             )
         return self._client
 

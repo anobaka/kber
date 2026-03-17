@@ -343,7 +343,7 @@ class RepoAnalyzer:
                 repo_id, blocks_to_generate, changed_files,
             )
             if affected_dirs:
-                _notify(f"📝 正在更新 {len(affected_dirs)} 个模块摘要...")
+                _notify(f"📝 正在更新 {len(affected_dirs)} 个模块摘要...", progress=True)
                 updated = self._regenerate_module_summaries(
                     kb_id, repo_id, affected_dirs, repo_map, _notify,
                     check_cancelled_fn=_check,
@@ -356,8 +356,12 @@ class RepoAnalyzer:
             _check()
             if blocks_to_generate or affected_dirs:
                 _notify("📋 正在更新仓库概览...", progress=True)
-                self._regenerate_repo_overview(kb_id, repo_id, repo_map)
-                _notify("✅ 仓库概览更新完成", progress=True, done=True)
+                try:
+                    self._regenerate_repo_overview(kb_id, repo_id, repo_map)
+                    _notify("✅ 仓库概览更新完成", progress=True, done=True)
+                except Exception:
+                    logger.exception("Failed to regenerate repo overview for repo %d", repo_id)
+                    _notify("⚠️ 仓库概览更新失败", progress=True, done=True)
 
             self._finish_task_log(task_log_id, "success", stats)
 

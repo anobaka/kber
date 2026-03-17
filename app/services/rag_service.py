@@ -27,6 +27,7 @@ class RAGService:
 
         # Get all kb_ids bound to this chat
         kb_ids = self._get_bound_kb_ids(chat_id)
+        logger.info("Chat %s bound kb_ids: %s", chat_id, kb_ids)
         if not kb_ids:
             return "⚠️ 本群尚未绑定知识库，请先发送「绑定知识库 {名称}」进行绑定。"
 
@@ -42,6 +43,7 @@ class RAGService:
         for kb_id in kb_ids:
             try:
                 hits = milvus_service.search(kb_id, query_vector, top_k=10)
+                logger.info("KB %d returned %d hits", kb_id, len(hits))
                 all_hits.extend(hits)
             except Exception as e:
                 logger.warning("Search failed for kb_%d: %s", kb_id, e)

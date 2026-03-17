@@ -237,12 +237,6 @@ class FeishuBot:
         try:
             if msg_type == "text":
                 content = json.dumps({"text": text})
-            elif msg_type == "post":
-                content = json.dumps({
-                    "zh_cn": {
-                        "content": [[{"tag": "text", "text": text}]],
-                    },
-                })
             elif msg_type == "interactive":
                 content = text  # Already JSON
             else:
