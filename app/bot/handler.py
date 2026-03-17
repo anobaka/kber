@@ -377,30 +377,36 @@ class FeishuBot:
         q_short = question[:200] if question else ""
         a_short = answer[:1500] if answer else ""
 
+        # Common callback value payload for buttons
+        _cb_base = {"question": q_short, "answer": a_short}
+
         if feedback_state is None:
-            # Initial state: show feedback buttons
+            # Initial state: two feedback buttons side by side via column_set
             elements.append({
-                "tag": "action",
-                "actions": [
+                "tag": "column_set",
+                "flex_mode": "flow",
+                "columns": [
                     {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "👍 有用"},
-                        "type": "primary",
-                        "value": {
-                            "action": "feedback_helpful",
-                            "question": q_short,
-                            "answer": a_short,
-                        },
+                        "tag": "column",
+                        "width": "auto",
+                        "weight": 1,
+                        "elements": [{
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "👍 有用"},
+                            "type": "primary",
+                            "behaviors": [{"type": "callback", "value": {**_cb_base, "action": "feedback_helpful"}}],
+                        }],
                     },
                     {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "👎 没用"},
-                        "type": "default",
-                        "value": {
-                            "action": "feedback_not_helpful",
-                            "question": q_short,
-                            "answer": a_short,
-                        },
+                        "tag": "column",
+                        "width": "auto",
+                        "weight": 1,
+                        "elements": [{
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "👎 没用"},
+                            "type": "default",
+                            "behaviors": [{"type": "callback", "value": {**_cb_base, "action": "feedback_not_helpful"}}],
+                        }],
                     },
                 ],
             })
@@ -412,7 +418,7 @@ class FeishuBot:
                 "margin": "4px 0px 0px 0px",
             })
         elif feedback_state == "not_helpful_ask":
-            # Show form for reason input
+            # Show form for reason input + submit/skip buttons
             elements.append({
                 "tag": "markdown",
                 "content": "👎 感谢反馈！如果方便，请告诉我们哪里可以改进：",
@@ -420,38 +426,46 @@ class FeishuBot:
                 "margin": "4px 0px 0px 0px",
             })
             elements.append({
-                "tag": "action",
-                "actions": [
+                "tag": "form_container",
+                "name": "feedback_form",
+                "elements": [
                     {
                         "tag": "input",
                         "name": "feedback_reason",
                         "placeholder": {"tag": "plain_text", "content": "请输入原因（可选）"},
                         "width": "fill",
                     },
-                ],
-            })
-            elements.append({
-                "tag": "action",
-                "actions": [
                     {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "提交"},
-                        "type": "primary",
-                        "value": {
-                            "action": "feedback_submit_reason",
-                            "question": q_short,
-                            "answer": a_short,
-                        },
-                    },
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "跳过"},
-                        "type": "default",
-                        "value": {
-                            "action": "feedback_skip_reason",
-                            "question": q_short,
-                            "answer": a_short,
-                        },
+                        "tag": "column_set",
+                        "flex_mode": "flow",
+                        "columns": [
+                            {
+                                "tag": "column",
+                                "width": "auto",
+                                "weight": 1,
+                                "elements": [{
+                                    "tag": "button",
+                                    "text": {"tag": "plain_text", "content": "提交"},
+                                    "type": "primary",
+                                    "name": "submit_btn",
+                                    "form_action_type": "submit",
+                                    "behaviors": [{"type": "callback", "value": {**_cb_base, "action": "feedback_submit_reason"}}],
+                                }],
+                            },
+                            {
+                                "tag": "column",
+                                "width": "auto",
+                                "weight": 1,
+                                "elements": [{
+                                    "tag": "button",
+                                    "text": {"tag": "plain_text", "content": "跳过"},
+                                    "type": "default",
+                                    "name": "skip_btn",
+                                    "form_action_type": "submit",
+                                    "behaviors": [{"type": "callback", "value": {**_cb_base, "action": "feedback_skip_reason"}}],
+                                }],
+                            },
+                        ],
                     },
                 ],
             })
