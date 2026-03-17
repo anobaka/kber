@@ -36,6 +36,8 @@ def main() -> None:
     )
     for h in root_logger.handlers:
         h.setFormatter(formatter)
+    # Alembic's fileConfig resets root logger level to WARNING; restore it.
+    logging.getLogger().setLevel(logging.DEBUG)
 
     # Connect to Milvus
     logger.info("Connecting to Milvus...")
