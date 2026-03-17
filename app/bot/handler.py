@@ -15,6 +15,10 @@ from lark_oapi.api.im.v1 import (
     PatchMessageRequest,
     PatchMessageRequestBody,
 )
+from lark_oapi.event.callback.model.p2_card_action_trigger import (
+    P2CardActionTrigger,
+    P2CardActionTriggerResponse,
+)
 
 from app.config import config
 from app.db.models import ChatMessage, ResponseFeedback
@@ -95,19 +99,13 @@ class FeishuBot:
             .register_p2_im_message_receive_v1(
                 lambda event: self._on_message(None, event, router)
             ) \
-            .build()
-
-        card_handler = lark.CardActionHandler.builder("", "") \
-            .register(
-                lambda ctx, card_action: self.handle_card_action(card_action)
-            ) \
+            .register_p2_card_action_trigger(self._on_card_action) \
             .build()
 
         self._ws_client = lark.ws.Client(
             config.FEISHU_APP_ID,
             config.FEISHU_APP_SECRET,
             event_handler=event_handler,
-            card_handler=card_handler,
             log_level=lark.LogLevel.WARNING,
         )
         logger.info("Starting Feishu bot WebSocket connection...")
@@ -373,8 +371,11 @@ class FeishuBot:
             {"tag": "hr"},
         ]
 
-        # Truncate question for storage in button value (Feishu has value size limits)
+        # Truncate question/answer for storage in button value (Feishu has value size limits).
+        # Answer is stored in the value so the callback can rebuild the card
+        # (P2CardActionTrigger does not include the original card content).
         q_short = question[:200] if question else ""
+        a_short = answer[:1500] if answer else ""
 
         if feedback_state is None:
             # Initial state: show feedback buttons
@@ -388,6 +389,7 @@ class FeishuBot:
                         "value": {
                             "action": "feedback_helpful",
                             "question": q_short,
+                            "answer": a_short,
                         },
                     },
                     {
@@ -397,6 +399,7 @@ class FeishuBot:
                         "value": {
                             "action": "feedback_not_helpful",
                             "question": q_short,
+                            "answer": a_short,
                         },
                     },
                 ],
@@ -437,6 +440,7 @@ class FeishuBot:
                         "value": {
                             "action": "feedback_submit_reason",
                             "question": q_short,
+                            "answer": a_short,
                         },
                     },
                     {
@@ -446,6 +450,7 @@ class FeishuBot:
                         "value": {
                             "action": "feedback_skip_reason",
                             "question": q_short,
+                            "answer": a_short,
                         },
                     },
                 ],
@@ -474,59 +479,50 @@ class FeishuBot:
         }
         return card
 
-    def handle_card_action(self, card_action: Any) -> dict | None:
-        """Handle interactive card action callbacks (feedback buttons).
+    def _on_card_action(self, data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
+        """SDK callback for card action events (registered via register_p2_card_action_trigger)."""
+        card_data = self._handle_card_action(data)
+        if card_data is None:
+            return P2CardActionTriggerResponse({})
+        return P2CardActionTriggerResponse({
+            "card": {
+                "type": "raw",
+                "data": card_data,
+            },
+        })
 
-        Returns a card dict to replace the current card, or None.
-        """
+    def _handle_card_action(self, data: P2CardActionTrigger) -> dict | None:
+        """Process card action and return an updated card dict, or None."""
         try:
-            action = card_action.action
-            action_value = action.get("value", {}) if isinstance(action, dict) else getattr(action, "value", {})
-            if isinstance(action_value, str):
-                action_value = json.loads(action_value)
+            event = data.event
+            if not event:
+                return None
 
+            action = event.action
+            if not action:
+                return None
+
+            action_value = action.value or {}
             action_type = action_value.get("action", "")
             question = action_value.get("question", "")
 
-            # Get operator info
-            operator = card_action.operator
-            user_open_id = ""
-            if operator:
-                user_open_id = getattr(operator, "open_id", "") or ""
+            # Operator info
+            operator = event.operator
+            user_open_id = operator.open_id if operator else ""
 
-            # Get the message_id of the card being interacted with
-            open_message_id = getattr(card_action, "open_message_id", "") or ""
-            # Get chat_id from the card action context
-            context = getattr(card_action, "context", None)
-            chat_id = ""
-            if context:
-                open_chat_id = getattr(context, "open_chat_id", "") or ""
-                chat_id = open_chat_id
+            # Message and chat context
+            ctx = event.context
+            open_message_id = ctx.open_message_id if ctx else ""
+            chat_id = ctx.open_chat_id if ctx else ""
 
-            # Read the existing answer from the card (to preserve it in updated card)
-            token = getattr(card_action, "token", "") or ""
+            # Extract the original answer from the card to preserve in the updated card.
+            # The card content is not available in P2CardActionTrigger, so we look it up
+            # from the feedback record or fall back to fetching via API.
+            # For simplicity, we store the answer in the button value alongside the question.
+            answer_content = action_value.get("answer", "")
 
-            # We need the original answer content from the card elements
-            # Support both JSON 2.0 (body.elements) and 1.0 (elements) structures
-            card = getattr(card_action, "card", None)
-            answer_content = ""
-            if card and isinstance(card, dict):
-                body = card.get("body", {})
-                elements = (
-                    body.get("elements", []) if isinstance(body, dict) and body
-                    else card.get("elements", [])
-                )
-                for elem in elements:
-                    e = elem if isinstance(elem, dict) else {}
-                    if e.get("tag") == "markdown" and e.get("content", "").strip():
-                        answer_content = e["content"]
-                        break
-
-            # Get form input values (for reason submission)
-            form_value = action.get("form_value", {}) if isinstance(action, dict) else getattr(action, "form_value", {})
-            if isinstance(form_value, str):
-                form_value = json.loads(form_value) if form_value else {}
-            form_value = form_value or {}
+            # Form input values (for reason submission)
+            form_value = action.form_value or {}
 
             if action_type == "feedback_helpful":
                 self._save_feedback(
@@ -542,7 +538,6 @@ class FeishuBot:
                 )
 
             elif action_type == "feedback_not_helpful":
-                # First save the not_helpful feedback (reason can be added later)
                 self._save_feedback(
                     chat_id=chat_id,
                     message_id=open_message_id,
