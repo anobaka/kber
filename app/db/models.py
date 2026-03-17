@@ -158,9 +158,12 @@ class CodeBlock(Base):
         String(64), comment="SHA-256 of code content, used to detect changes",
     )
     commit_hash: Mapped[Optional[str]] = mapped_column(String(64))
+    description: Mapped[Optional[str]] = mapped_column(
+        Text, comment="LLM-generated knowledge text, persisted before Milvus write",
+    )
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="pending",
-        comment="pending / success / failed",
+        comment="pending / generated / success / failed",
     )
     error_message: Mapped[Optional[str]] = mapped_column(Text)
     retry_count: Mapped[int] = mapped_column(

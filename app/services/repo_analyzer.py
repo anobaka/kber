@@ -343,20 +343,32 @@ class RepoAnalyzer:
             _check()
             repo_map = self._generate_repo_map(repo_dir, all_files)
 
+            # Load blocks that already have LLM descriptions from a previous
+            # interrupted run (status='generated') — skip LLM, go straight
+            # to embedding + Milvus write.
+            cached_entries = self._load_generated_blocks(repo_id, current_commit)
+            if cached_entries:
+                _notify(f"♻️ 恢复 {len(cached_entries)} 个已缓存的代码块描述，跳过 LLM 生成", progress=True)
+
             if blocks_to_generate:
                 success_entries, failed_count = self._generate_block_knowledge(
                     blocks_to_generate, repo_map, kb_id, repo_id, current_commit,
                     notify_fn=_notify, check_cancelled_fn=_check,
                 )
-                stats["blocks_success"] = len(success_entries)
                 stats["blocks_failed"] = failed_count
-                stats["knowledge_generated"] = len(success_entries)
+            else:
+                success_entries = []
 
-                # Write successful entries to Milvus
-                if success_entries:
-                    _notify("💾 正在写入代码块知识...", progress=True)
-                    self._store_block_knowledge(kb_id, success_entries)
-                    _notify("✅ 代码块知识写入完成", progress=True, done=True)
+            # Merge newly generated entries with cached ones
+            all_entries = cached_entries + success_entries
+            stats["blocks_success"] = len(all_entries)
+            stats["knowledge_generated"] = len(all_entries)
+
+            # Write all entries to Milvus (batch embedding)
+            if all_entries:
+                _notify("💾 正在写入代码块知识...", progress=True)
+                self._store_block_knowledge(kb_id, all_entries)
+                _notify("✅ 代码块知识写入完成", progress=True, done=True)
 
             # Always advance commit hash (file-level checkpoint)
             self._update_repo_commit(repo_id, current_commit)
@@ -717,8 +729,9 @@ class RepoAnalyzer:
                 chash = _content_hash(block.get("code", ""))
 
                 existing = existing_map.get(key)
-                if existing and existing.content_hash == chash and existing.status == "success":
-                    # Code hasn't changed and was successfully processed → skip
+                if existing and existing.content_hash == chash and existing.status in ("success", "generated"):
+                    # Code hasn't changed and was successfully processed (or LLM
+                    # already generated the description) → skip LLM generation.
                     continue
 
                 if existing:
@@ -815,6 +828,70 @@ class RepoAnalyzer:
 
             return blocks
 
+    def _mark_block_generated(self, cb_id: int, description: str) -> None:
+        """Mark a block as 'generated' and persist its LLM description.
+
+        This is an intermediate checkpoint: the LLM call succeeded, but the
+        description hasn't been embedded/written to Milvus yet.  If the
+        process is interrupted before Milvus write, the description can be
+        recovered on the next run without re-calling the LLM.
+        """
+        with get_session() as session:
+            session.execute(
+                update(CodeBlock).where(CodeBlock.id == cb_id).values(
+                    status="generated",
+                    description=description,
+                    error_message=None,
+                )
+            )
+
+    def _load_generated_blocks(
+        self, repo_id: int, commit_hash: str,
+    ) -> list[dict[str, Any]]:
+        """Load blocks with ``status='generated'`` — LLM description cached in DB.
+
+        These blocks had their LLM generation completed in a previous run but
+        the process was interrupted before embedding + Milvus write.  We can
+        skip the LLM call and go straight to the storage step.
+        """
+        with get_session() as session:
+            rows = session.execute(
+                select(CodeBlock).where(
+                    CodeBlock.repo_id == repo_id,
+                    CodeBlock.status == "generated",
+                )
+            ).scalars().all()
+
+            entries: list[dict[str, Any]] = []
+            for row in rows:
+                if not row.description:
+                    # Edge case: generated but description is empty — reset to pending
+                    row.status = "pending"
+                    continue
+                entries.append({
+                    "block": {
+                        "file_path": row.file_path,
+                        "block_type": row.block_type,
+                        "block_name": row.block_name,
+                        "parent_class": row.parent_class,
+                        "start_line": row.start_line,
+                        "end_line": row.end_line,
+                        "language": LANG_MAP.get(
+                            os.path.splitext(row.file_path)[1].lower(), "",
+                        ),
+                        "_cb_id": row.id,
+                    },
+                    "description": row.description,
+                    "commit_hash": commit_hash,
+                })
+
+            if entries:
+                logger.info(
+                    "Loaded %d generated blocks (LLM cached) for repo %d",
+                    len(entries), repo_id,
+                )
+            return entries
+
     def _mark_block_success(self, cb_id: int, milvus_id: str | None = None) -> None:
         with get_session() as session:
             session.execute(
@@ -839,9 +916,13 @@ class RepoAnalyzer:
         This can happen when a previous run was interrupted after LLM
         generation but before Milvus write completed.  Such blocks are
         marked ``success`` in MySQL but have no corresponding Milvus
-        entry, causing them to be skipped on subsequent runs.
+        entry.
 
-        Returns the number of blocks reset to ``pending``.
+        If the block still has a ``description`` cached, it is reset to
+        ``generated`` (so the LLM call can be skipped on the next run).
+        Otherwise it is reset to ``pending``.
+
+        Returns the number of blocks repaired.
         """
         with get_session() as session:
             success_blocks = session.execute(
@@ -857,22 +938,35 @@ class RepoAnalyzer:
             # Get topics present in Milvus for this KB
             milvus_topics = milvus_service.get_existing_topics(kb_id)
 
-            orphaned_ids: list[int] = []
+            to_generated: list[int] = []
+            to_pending: list[int] = []
             for block in success_blocks:
                 topic = f"{block.file_path}:{block.block_name or ''}"
                 if topic not in milvus_topics:
-                    orphaned_ids.append(block.id)
+                    if block.description:
+                        to_generated.append(block.id)
+                    else:
+                        to_pending.append(block.id)
 
-            if orphaned_ids:
+            repaired = len(to_generated) + len(to_pending)
+            if to_generated:
                 session.execute(
                     update(CodeBlock)
-                    .where(CodeBlock.id.in_(orphaned_ids))
+                    .where(CodeBlock.id.in_(to_generated))
+                    .values(status="generated", error_message=None)
+                )
+            if to_pending:
+                session.execute(
+                    update(CodeBlock)
+                    .where(CodeBlock.id.in_(to_pending))
                     .values(status="pending", retry_count=0, error_message=None)
                 )
+
+            if repaired:
                 logger.info(
-                    "Repaired %d orphaned blocks (success in DB but missing from Milvus) "
-                    "for repo %d — reset to pending",
-                    len(orphaned_ids), repo_id,
+                    "Repaired %d orphaned blocks for repo %d "
+                    "(reset %d to generated, %d to pending)",
+                    repaired, repo_id, len(to_generated), len(to_pending),
                 )
             else:
                 logger.debug(
@@ -880,7 +974,7 @@ class RepoAnalyzer:
                     repo_id, len(success_blocks),
                 )
 
-            return len(orphaned_ids)
+            return repaired
 
     # ================================================================== #
     #  Block-level knowledge generation                                    #
@@ -972,8 +1066,12 @@ class RepoAnalyzer:
                     code=code[:8000],
                 )
 
-                # NOTE: Do not mark success here — mark after Milvus write
-                # to avoid orphaned blocks if the process is interrupted.
+                # Persist description to DB immediately so it survives
+                # process interruption.  Final "success" is set after
+                # Milvus write in _store_block_knowledge.
+                if cb_id:
+                    self._mark_block_generated(cb_id, description)
+
                 return {
                     "block": block,
                     "description": description,
