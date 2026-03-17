@@ -72,6 +72,7 @@ CREATE TABLE chat_message (
     message_id VARCHAR(100) NOT NULL UNIQUE,
     parent_id VARCHAR(100) DEFAULT NULL COMMENT '飞书回复消息的 parent_message_id，用于话题分组',
     sender_id VARCHAR(100),
+    user_id VARCHAR(100) DEFAULT NULL COMMENT '飞书 user_id（工号）',
     content TEXT,
     msg_type VARCHAR(20) DEFAULT 'text',
     processed BOOLEAN DEFAULT FALSE COMMENT '是否已被归纳处理',
