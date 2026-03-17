@@ -1,0 +1,844 @@
+"""Command router – parses user commands and dispatches to handlers."""
+
+import logging
+import re
+import threading
+from datetime import datetime
+from typing import Any
+
+from sqlalchemy import func, select, update
+
+from sqlalchemy import delete as sa_delete
+
+from app.db.models import (
+    AdminUser,
+    ChatKbBinding,
+    ChatMessage,
+    ChatRepoBinding,
+    ChatSettings,
+    CodeBlock,
+    CodeRepo,
+    KnowledgeBase,
+    ManualKnowledge,
+    SummarizeTaskLog,
+)
+from app.config import config
+from app.db.session import get_session
+from app.services.milvus_service import milvus_service
+from app.services.rag_service import rag_service
+
+logger = logging.getLogger(__name__)
+
+# Accepts full HTTPS URL or short path like "org/repo" or "org/repo.git"
+GIT_REPO_PATTERN = re.compile(
+    r"^(https?://[\w.\-/]+|[\w.\-]+/[\w.\-/]+)$"
+)
+
+
+def normalize_git_url(raw: str) -> str:
+    """Normalize a git repo identifier to a canonical short path.
+
+    If the input is a full URL that matches ``GIT_BASE_URL``, strip the base
+    and trailing ``.git`` to produce the short ``org/repo`` form.  Otherwise
+    return the input unchanged (with trailing ``.git`` stripped).
+    """
+    url = raw.strip().rstrip("/")
+
+    # Full URL → try to reduce to short path
+    if url.startswith("http://") or url.startswith("https://"):
+        base = config.GIT_BASE_URL.rstrip("/")
+        if base:
+            for prefix in (base + "/", base.replace("https://", "http://") + "/"):
+                if url.startswith(prefix):
+                    url = url[len(prefix):]
+                    break
+
+    # Strip trailing .git
+    if url.endswith(".git"):
+        url = url[:-4]
+
+    return url.strip("/")
+
+
+from app.services.cancel import (
+    CancelledError,
+    check_cancelled,
+    clear_cancel_event,
+    get_cancel_event,
+)
+
+
+class CommandRouter:
+    """Routes incoming user commands to the appropriate handler."""
+
+    def __init__(self, bot: Any) -> None:
+        self.bot = bot
+
+    # Commands that take a parameter (prefix match).
+    # Each entry: (chinese_prefix, english_prefix, handler_method_name)
+    _PREFIX_COMMANDS: list[tuple[str, str, str]] = [
+        ("绑定知识库", "bind-kb", "_bind_kb"),
+        ("解绑知识库", "unbind-kb", "_unbind_kb"),
+        ("绑定代码库", "bind-repo", "_bind_repo"),
+        ("解绑代码库", "unbind-repo", "_unbind_repo"),
+        ("添加知识", "add-knowledge", "_add_knowledge"),
+        ("重建知识库", "rebuild-kb", "_rebuild_kb"),
+        ("停止构建", "stop-build", "_stop_build"),
+        ("恢复构建", "resume-build", "_resume_build"),
+        ("添加管理员", "add-admin", "_add_admin"),
+        ("移除管理员", "remove-admin", "_remove_admin"),
+    ]
+
+    # Commands that must match exactly (no parameter).
+    # Each entry: (set_of_aliases, handler_method_name)
+    _EXACT_COMMANDS: list[tuple[set[str], str]] = [
+        ({"立即总结", "summarize"}, "_force_summarize"),
+        ({"查询知识库", "list-kb"}, "_query_kb_status"),
+    ]
+
+    def handle(self, chat_id: str, message_id: str, sender_id: str, text: str, *, user_id: str = "") -> None:
+        """Parse command prefix and dispatch."""
+        text = text.strip()
+
+        # Prefix commands (with parameter)
+        for cn, en, method in self._PREFIX_COMMANDS:
+            for prefix in (cn, en):
+                if text.startswith(prefix):
+                    arg = text[len(prefix):].strip()
+                    getattr(self, method)(chat_id, sender_id, arg)
+                    return
+
+        # Exact-match commands (no parameter)
+        for aliases, method in self._EXACT_COMMANDS:
+            if text in aliases:
+                getattr(self, method)(chat_id, sender_id)
+                return
+
+        # Special cases
+        if text in ("enable-debug",):
+            self._set_debug(chat_id, sender_id, True)
+        elif text in ("disable-debug",):
+            self._set_debug(chat_id, sender_id, False)
+        elif text.lower() in ("我的id", "myid"):
+            id_msg = f"你的用户 ID：`{sender_id}`"
+            if user_id:
+                id_msg += f"\n你的工号：`{user_id}`"
+            self.bot.send_message(chat_id, id_msg)
+        elif text.lower() in ("清空上下文", "clear-context"):
+            self._clear_context(chat_id)
+        elif text.lower() in ("帮助", "help"):
+            self._show_help(chat_id)
+        else:
+            # Free-form question → RAG
+            self._rag_query(chat_id, sender_id, text)
+
+    # ------------------------------------------------------------------
+    # Command handlers
+    # ------------------------------------------------------------------
+
+    def _bind_kb(self, chat_id: str, sender_id: str, kb_name: str) -> None:
+        if not kb_name:
+            self.bot.send_message(chat_id, "⚠️ 知识库名称不能为空，请使用格式：绑定知识库 {名称} / bind-kb {name}")
+            return
+
+        with get_session() as session:
+            # Find or create KB
+            kb = session.execute(
+                select(KnowledgeBase).where(
+                    KnowledgeBase.name == kb_name,
+                    KnowledgeBase.deleted_at.is_(None),
+                )
+            ).scalar_one_or_none()
+
+            if not kb:
+                kb = KnowledgeBase(
+                    name=kb_name,
+                    kb_type="chat",
+                    milvus_collection=None,  # Will be set when collection is created
+                )
+                session.add(kb)
+                session.flush()
+
+            # Check existing binding
+            existing = session.execute(
+                select(ChatKbBinding).where(
+                    ChatKbBinding.chat_id == chat_id,
+                    ChatKbBinding.kb_id == kb.id,
+                    ChatKbBinding.deleted_at.is_(None),
+                )
+            ).scalar_one_or_none()
+
+            if existing:
+                self.bot.send_message(chat_id, f"ℹ️ 本群已绑定到知识库「{kb_name}」。")
+                return
+
+            session.add(ChatKbBinding(chat_id=chat_id, kb_id=kb.id))
+
+            # Ensure Milvus collection exists
+            milvus_service.ensure_collection(kb.id)
+
+            if not kb.milvus_collection:
+                kb.milvus_collection = f"kb_{kb.id}"
+
+        self.bot.send_message(chat_id, f"✅ 已将本群绑定到知识库「{kb_name}」，正在拉取历史消息...")
+
+        # Trigger async history fetch
+        self._async_history_compensate(chat_id)
+
+    def _unbind_kb(self, chat_id: str, sender_id: str, kb_name: str) -> None:
+        if not kb_name:
+            self.bot.send_message(chat_id, "⚠️ 知识库名称不能为空，请使用格式：解绑知识库 {名称} / unbind-kb {name}")
+            return
+
+        with get_session() as session:
+            kb = session.execute(
+                select(KnowledgeBase).where(
+                    KnowledgeBase.name == kb_name,
+                    KnowledgeBase.deleted_at.is_(None),
+                )
+            ).scalar_one_or_none()
+
+            if not kb:
+                self.bot.send_message(chat_id, f"⚠️ 知识库「{kb_name}」不存在。")
+                return
+
+            binding = session.execute(
+                select(ChatKbBinding).where(
+                    ChatKbBinding.chat_id == chat_id,
+                    ChatKbBinding.kb_id == kb.id,
+                    ChatKbBinding.deleted_at.is_(None),
+                )
+            ).scalar_one_or_none()
+
+            if not binding:
+                self.bot.send_message(chat_id, f"⚠️ 本群未绑定知识库「{kb_name}」。")
+                return
+
+            binding.deleted_at = datetime.utcnow()
+
+        self.bot.send_message(chat_id, f"✅ 已解绑知识库「{kb_name}」，后续消息将不再纳入该知识库。")
+
+    def _bind_repo(self, chat_id: str, sender_id: str, git_url: str) -> None:
+        if not git_url:
+            self.bot.send_message(
+                chat_id,
+                "⚠️ 代码库地址不能为空，请使用格式：绑定代码库 org/repo / bind-repo org/repo",
+            )
+            return
+
+        if not GIT_REPO_PATTERN.match(git_url):
+            self.bot.send_message(chat_id, "⚠️ 格式不正确，请使用 org/repo 或 https://... 格式。")
+            return
+
+        git_url = normalize_git_url(git_url)
+
+        with get_session() as session:
+            # Find or create repo
+            repo = session.execute(
+                select(CodeRepo).where(
+                    CodeRepo.git_url == git_url,
+                    CodeRepo.deleted_at.is_(None),
+                )
+            ).scalar_one_or_none()
+
+            if not repo:
+                # Create a code-type knowledge base for this repo (or reuse existing)
+                repo_name = git_url  # e.g. "fusion/crane"
+                kb = session.execute(
+                    select(KnowledgeBase).where(
+                        KnowledgeBase.name == repo_name,
+                        KnowledgeBase.deleted_at.is_(None),
+                    )
+                ).scalar_one_or_none()
+                if not kb:
+                    kb = KnowledgeBase(
+                        name=repo_name,
+                        kb_type="code",
+                        description=f"Code knowledge from {git_url}",
+                    )
+                    session.add(kb)
+                    session.flush()
+
+                milvus_service.ensure_collection(kb.id)
+                kb.milvus_collection = f"kb_{kb.id}"
+
+                repo = CodeRepo(
+                    git_url=git_url,
+                    kb_id=kb.id,
+                )
+                session.add(repo)
+                session.flush()
+
+            # Check existing binding
+            existing = session.execute(
+                select(ChatRepoBinding).where(
+                    ChatRepoBinding.chat_id == chat_id,
+                    ChatRepoBinding.repo_id == repo.id,
+                    ChatRepoBinding.deleted_at.is_(None),
+                )
+            ).scalar_one_or_none()
+
+            if existing:
+                self.bot.send_message(chat_id, f"ℹ️ 本群已绑定该代码库。")
+                return
+
+            session.add(ChatRepoBinding(chat_id=chat_id, repo_id=repo.id))
+            repo_id = repo.id
+
+        self.bot.send_message(chat_id, f"✅ 已绑定代码库「{git_url}」，正在克隆并分析代码，请稍候...")
+
+        # Trigger async full analysis
+        self._async_repo_analysis(repo_id, chat_id)
+
+    def _unbind_repo(self, chat_id: str, sender_id: str, git_url: str) -> None:
+        if not git_url:
+            self.bot.send_message(chat_id, "⚠️ 代码库地址不能为空。")
+            return
+
+        git_url = normalize_git_url(git_url)
+
+        with get_session() as session:
+            repo = session.execute(
+                select(CodeRepo).where(
+                    CodeRepo.git_url == git_url,
+                    CodeRepo.deleted_at.is_(None),
+                )
+            ).scalar_one_or_none()
+
+            if not repo:
+                self.bot.send_message(chat_id, "⚠️ 未找到该代码库。")
+                return
+
+            binding = session.execute(
+                select(ChatRepoBinding).where(
+                    ChatRepoBinding.chat_id == chat_id,
+                    ChatRepoBinding.repo_id == repo.id,
+                    ChatRepoBinding.deleted_at.is_(None),
+                )
+            ).scalar_one_or_none()
+
+            if not binding:
+                self.bot.send_message(chat_id, "⚠️ 本群未绑定该代码库。")
+                return
+
+            binding.deleted_at = datetime.utcnow()
+
+        self.bot.send_message(chat_id, f"✅ 已解绑代码库「{git_url}」。")
+
+    def _add_knowledge(self, chat_id: str, sender_id: str, content: str) -> None:
+        if not content:
+            self.bot.send_message(
+                chat_id,
+                "⚠️ 知识内容不能为空，请使用格式：添加知识 {内容} / add-knowledge {content}",
+            )
+            return
+
+        with get_session() as session:
+            # Get non-code KBs bound to this chat
+            bound_kbs = session.execute(
+                select(KnowledgeBase).join(
+                    ChatKbBinding, ChatKbBinding.kb_id == KnowledgeBase.id,
+                ).where(
+                    ChatKbBinding.chat_id == chat_id,
+                    ChatKbBinding.deleted_at.is_(None),
+                    KnowledgeBase.kb_type != "code",
+                    KnowledgeBase.deleted_at.is_(None),
+                )
+            ).scalars().all()
+
+            if not bound_kbs:
+                self.bot.send_message(chat_id, "⚠️ 本群尚未绑定非代码知识库，请先发送「绑定知识库 {名称}」/ 「bind-kb {name}」进行绑定。")
+                return
+
+            # Try to parse optional KB name: first word might be a KB name
+            target_kb = None
+            kb_names = {kb.name for kb in bound_kbs}
+            first_word = content.split()[0] if content.split() else ""
+            if first_word in kb_names:
+                target_kb_name = first_word
+                content = content[len(first_word):].strip()
+                if not content:
+                    self.bot.send_message(chat_id, "⚠️ 知识内容不能为空。")
+                    return
+                target_kb = next(kb for kb in bound_kbs if kb.name == target_kb_name)
+
+            if target_kb is None:
+                if len(bound_kbs) == 1:
+                    target_kb = bound_kbs[0]
+                else:
+                    # Multiple KBs, must specify
+                    kb_list = "\n".join(f"  - {kb.name}" for kb in bound_kbs)
+                    self.bot.send_message(
+                        chat_id,
+                        f"⚠️ 本群绑定了多个知识库，请指定目标知识库：\n{kb_list}\n\n"
+                        f"格式：添加知识 {{知识库名称}} {{内容}} / add-knowledge {{kb_name}} {{content}}",
+                    )
+                    return
+
+            if len(content) > 5000:
+                self.bot.send_message(chat_id, "⚠️ 知识内容过长，请控制在 5000 字符以内。")
+                return
+
+            session.add(ManualKnowledge(
+                kb_id=target_kb.id,
+                chat_id=chat_id,
+                sender_id=sender_id,
+                content=content,
+            ))
+            kb_id = target_kb.id
+            kb_name = target_kb.name
+
+        self.bot.send_message(chat_id, f"✅ 知识已添加到「{kb_name}」，正在归纳整合中。")
+        self._async_summarize(kb_id)
+
+    def _force_summarize(self, chat_id: str, sender_id: str) -> None:
+        if not self._is_admin(sender_id):
+            self.bot.send_message(chat_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
+            return
+
+        with get_session() as session:
+            # Get bound KBs with names
+            kbs = session.execute(
+                select(KnowledgeBase).join(
+                    ChatKbBinding, ChatKbBinding.kb_id == KnowledgeBase.id,
+                ).where(
+                    ChatKbBinding.chat_id == chat_id,
+                    ChatKbBinding.deleted_at.is_(None),
+                    KnowledgeBase.deleted_at.is_(None),
+                )
+            ).scalars().all()
+
+            # Get bound repos with URLs
+            repos = session.execute(
+                select(CodeRepo).join(
+                    ChatRepoBinding, ChatRepoBinding.repo_id == CodeRepo.id,
+                ).where(
+                    ChatRepoBinding.chat_id == chat_id,
+                    ChatRepoBinding.deleted_at.is_(None),
+                    CodeRepo.deleted_at.is_(None),
+                )
+            ).scalars().all()
+
+        if not kbs and not repos:
+            self.bot.send_message(chat_id, "⚠️ 本群尚未绑定任何知识库或代码库。")
+            return
+
+        parts = []
+        if kbs:
+            names = "、".join(f"「{kb.name}」" for kb in kbs)
+            parts.append(f"知识库 {names}")
+        if repos:
+            urls = "、".join(f"「{r.git_url}」" for r in repos)
+            parts.append(f"代码库 {urls}")
+        self.bot.send_message(chat_id, f"🔄 正在归纳 {'，'.join(parts)}，请稍候...")
+
+        for kb in kbs:
+            self._async_summarize(kb.id)
+        for repo in repos:
+            self._async_repo_analysis(repo.id, chat_id)
+
+    def _rebuild_kb(self, chat_id: str, sender_id: str, kb_name: str) -> None:
+        if not self._is_admin(sender_id):
+            self.bot.send_message(chat_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
+            return
+
+        if not kb_name:
+            self.bot.send_message(chat_id, "⚠️ 请指定知识库名称，格式：重建知识库 {名称} / rebuild-kb {name}")
+            return
+
+        with get_session() as session:
+            kb = session.execute(
+                select(KnowledgeBase).where(
+                    KnowledgeBase.name == kb_name,
+                    KnowledgeBase.deleted_at.is_(None),
+                )
+            ).scalar_one_or_none()
+
+            if not kb:
+                self.bot.send_message(chat_id, f"⚠️ 未找到知识库「{kb_name}」。")
+                return
+
+            kb_id = kb.id
+            kb_type = kb.kb_type
+
+            # For code KBs: clear code_block records and reset repo checkpoint
+            repo_id = None
+            if kb_type == "code":
+                repo = session.execute(
+                    select(CodeRepo).where(
+                        CodeRepo.kb_id == kb_id,
+                        CodeRepo.deleted_at.is_(None),
+                    )
+                ).scalar_one_or_none()
+                if repo:
+                    repo_id = repo.id
+                    session.execute(
+                        sa_delete(CodeBlock).where(CodeBlock.repo_id == repo_id)
+                    )
+                    repo.last_commit_hash = None
+                    repo.last_analyzed_at = None
+            else:
+                # For chat/manual KBs: reset processed flags
+                session.execute(
+                    update(ChatMessage).where(
+                        ChatMessage.chat_id.in_(
+                            select(ChatKbBinding.chat_id).where(
+                                ChatKbBinding.kb_id == kb_id,
+                                ChatKbBinding.deleted_at.is_(None),
+                            )
+                        ),
+                        ChatMessage.processed.is_(True),
+                    ).values(processed=False, topic_group_id=None)
+                )
+                session.execute(
+                    update(ManualKnowledge).where(
+                        ManualKnowledge.kb_id == kb_id,
+                        ManualKnowledge.processed.is_(True),
+                    ).values(processed=False)
+                )
+
+        # Clear Milvus collection
+        try:
+            milvus_service.drop_collection(kb_id)
+            milvus_service.ensure_collection(kb_id)
+        except Exception as e:
+            logger.warning("Failed to reset Milvus collection for kb_%d: %s", kb_id, e)
+
+        self.bot.send_message(chat_id, f"🔄 正在重建知识库「{kb_name}」（类型：{kb_type}），已清除旧数据...")
+
+        if kb_type == "code" and repo_id:
+            self._async_repo_analysis(repo_id, chat_id)
+        else:
+            self._async_summarize(kb_id)
+
+    def _stop_build(self, chat_id: str, sender_id: str, kb_name: str) -> None:
+        if not self._is_admin(sender_id):
+            self.bot.send_message(chat_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
+            return
+
+        if not kb_name:
+            self.bot.send_message(chat_id, "⚠️ 请指定知识库名称，格式：停止构建 {名称} / stop-build {name}")
+            return
+
+        with get_session() as session:
+            kb = session.execute(
+                select(KnowledgeBase).where(
+                    KnowledgeBase.name == kb_name,
+                    KnowledgeBase.deleted_at.is_(None),
+                )
+            ).scalar_one_or_none()
+
+        if not kb:
+            self.bot.send_message(chat_id, f"⚠️ 未找到知识库「{kb_name}」。")
+            return
+
+        ev = get_cancel_event(kb.id)
+        if ev.is_set():
+            self.bot.send_message(chat_id, f"ℹ️ 知识库「{kb_name}」的构建任务已在停止中。")
+            return
+
+        ev.set()
+        self.bot.send_message(chat_id, f"🛑 正在停止知识库「{kb_name}」的构建任务...")
+
+    def _resume_build(self, chat_id: str, sender_id: str, kb_name: str) -> None:
+        if not self._is_admin(sender_id):
+            self.bot.send_message(chat_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
+            return
+
+        if not kb_name:
+            self.bot.send_message(chat_id, "⚠️ 请指定知识库名称，格式：恢复构建 {名称} / resume-build {name}")
+            return
+
+        with get_session() as session:
+            kb = session.execute(
+                select(KnowledgeBase).where(
+                    KnowledgeBase.name == kb_name,
+                    KnowledgeBase.deleted_at.is_(None),
+                )
+            ).scalar_one_or_none()
+
+        if not kb:
+            self.bot.send_message(chat_id, f"⚠️ 未找到知识库「{kb_name}」。")
+            return
+
+        # Find code repos bound to this KB
+        with get_session() as session:
+            repos = session.execute(
+                select(CodeRepo).where(
+                    CodeRepo.kb_id == kb.id,
+                    CodeRepo.deleted_at.is_(None),
+                )
+            ).scalars().all()
+
+            if not repos:
+                self.bot.send_message(chat_id, f"⚠️ 知识库「{kb_name}」没有关联的代码库。")
+                return
+
+            repo_ids = [r.id for r in repos]
+
+        self.bot.send_message(chat_id, f"🔄 正在恢复构建知识库「{kb_name}」...")
+
+        for rid in repo_ids:
+            self._async_repo_analysis(rid, chat_id)
+
+    def _query_kb_status(self, chat_id: str, sender_id: str) -> None:
+        if not self._is_admin(sender_id):
+            self.bot.send_message(chat_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
+            return
+
+        with get_session() as session:
+            kbs = session.execute(
+                select(KnowledgeBase).where(KnowledgeBase.deleted_at.is_(None))
+            ).scalars().all()
+
+            if not kbs:
+                self.bot.send_message(chat_id, "ℹ️ 当前没有任何知识库。")
+                return
+
+            lines = [f"📚 知识库列表（共 {len(kbs)} 个）\n"]
+
+            for i, kb in enumerate(kbs, 1):
+                # Count bindings – code KBs use ChatRepoBinding, others use ChatKbBinding
+                if kb.kb_type == "code":
+                    code_repo = session.execute(
+                        select(CodeRepo).where(
+                            CodeRepo.kb_id == kb.id,
+                            CodeRepo.deleted_at.is_(None),
+                        )
+                    ).scalar_one_or_none()
+                    if code_repo:
+                        binding_count = session.execute(
+                            select(func.count()).select_from(ChatRepoBinding).where(
+                                ChatRepoBinding.repo_id == code_repo.id,
+                                ChatRepoBinding.deleted_at.is_(None),
+                            )
+                        ).scalar() or 0
+                    else:
+                        binding_count = 0
+                else:
+                    binding_count = session.execute(
+                        select(func.count()).select_from(ChatKbBinding).where(
+                            ChatKbBinding.kb_id == kb.id,
+                            ChatKbBinding.deleted_at.is_(None),
+                        )
+                    ).scalar() or 0
+
+                # Count Milvus entries
+                try:
+                    entry_count = milvus_service.get_collection_count(kb.id)
+                except Exception:
+                    entry_count = 0
+
+                # Last summarize time
+                last_log = session.execute(
+                    select(SummarizeTaskLog).where(
+                        SummarizeTaskLog.kb_id == kb.id,
+                        SummarizeTaskLog.status == "success",
+                    ).order_by(SummarizeTaskLog.finished_at.desc()).limit(1)
+                ).scalar_one_or_none()
+
+                last_time = "从未"
+                if last_log and last_log.finished_at:
+                    delta = datetime.utcnow() - last_log.finished_at
+                    if delta.total_seconds() < 3600:
+                        last_time = f"{int(delta.total_seconds() / 60)} 分钟前"
+                    elif delta.total_seconds() < 86400:
+                        last_time = f"{int(delta.total_seconds() / 3600)} 小时前"
+                    else:
+                        last_time = f"{int(delta.days)} 天前"
+
+                # Code repo info (code_repo already queried above for code KBs)
+                code_info = ""
+                if kb.kb_type == "code":
+                    if not code_repo:
+                        code_repo = session.execute(
+                            select(CodeRepo).where(
+                                CodeRepo.kb_id == kb.id,
+                                CodeRepo.deleted_at.is_(None),
+                            )
+                        ).scalar_one_or_none()
+                    if code_repo:
+                        code_info = f"\n   代码库：{code_repo.git_url}"
+
+                lines.append(
+                    f"{i}. {kb.name}（类型：{kb.kb_type}）{code_info}\n"
+                    f"   绑定群：{binding_count} | 知识条目：{entry_count:,} | 最近归纳：{last_time}"
+                )
+
+            self.bot.send_card(chat_id, "知识库状态", "\n\n".join(lines))
+
+    def _set_debug(self, chat_id: str, sender_id: str, enabled: bool) -> None:
+        if not self._is_admin(sender_id):
+            self.bot.send_message(chat_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
+            return
+
+        with get_session() as session:
+            settings = session.execute(
+                select(ChatSettings).where(ChatSettings.chat_id == chat_id)
+            ).scalar_one_or_none()
+
+            if settings:
+                settings.debug_mode = enabled
+            else:
+                session.add(ChatSettings(chat_id=chat_id, debug_mode=enabled))
+
+        status = "已开启" if enabled else "已关闭"
+        self.bot.send_message(chat_id, f"✅ 本群 Debug 模式{status}。")
+
+    def _add_admin(self, chat_id: str, sender_id: str, user_id: str) -> None:
+        if not self._is_admin(sender_id):
+            self.bot.send_message(chat_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
+            return
+        if not user_id:
+            self.bot.send_message(chat_id, "⚠️ 请提供用户 ID，格式：添加管理员 {用户ID} / add-admin {user_id}")
+            return
+
+        with get_session() as session:
+            existing = session.execute(
+                select(AdminUser).where(AdminUser.sender_id == user_id)
+            ).scalar_one_or_none()
+            if existing:
+                self.bot.send_message(chat_id, f"ℹ️ 用户 `{user_id}` 已经是管理员。")
+                return
+            session.add(AdminUser(sender_id=user_id))
+
+        self.bot.send_message(chat_id, f"✅ 已将用户 `{user_id}` 添加为管理员。")
+
+    def _remove_admin(self, chat_id: str, sender_id: str, user_id: str) -> None:
+        if not self._is_admin(sender_id):
+            self.bot.send_message(chat_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
+            return
+        if not user_id:
+            self.bot.send_message(chat_id, "⚠️ 请提供用户 ID，格式：移除管理员 {用户ID} / remove-admin {user_id}")
+            return
+        if user_id == sender_id:
+            self.bot.send_message(chat_id, "⚠️ 不能移除自己的管理员权限。")
+            return
+
+        with get_session() as session:
+            admin = session.execute(
+                select(AdminUser).where(AdminUser.sender_id == user_id)
+            ).scalar_one_or_none()
+            if not admin:
+                self.bot.send_message(chat_id, f"ℹ️ 用户 `{user_id}` 不是管理员。")
+                return
+            session.delete(admin)
+
+        self.bot.send_message(chat_id, f"✅ 已移除用户 `{user_id}` 的管理员权限。")
+
+    def _clear_context(self, chat_id: str) -> None:
+        rag_service.clear_context(chat_id)
+        self.bot.send_message(chat_id, "✅ 已清空对话上下文，下次提问将不携带历史记录。")
+
+    def _show_help(self, chat_id: str) -> None:
+        help_text = """📖 **可用命令：**
+
+**绑定知识库 / bind-kb** {名称}　— 将本群聊天记录纳入指定知识库
+**解绑知识库 / unbind-kb** {名称}　— 解除本群与知识库的绑定
+**绑定代码库 / bind-repo** {org/repo 或 URL}　— 关联代码库并自动分析
+**解绑代码库 / unbind-repo** {org/repo 或 URL}　— 解除代码库关联
+**添加知识 / add-knowledge** [知识库名称] {内容}　— 手动添加知识
+**清空上下文 / clear-context**　— 清空对话上下文，下次提问不携带历史记录
+**我的ID / myid**　— 获取你的用户 ID
+**帮助 / help**　— 显示本帮助信息
+
+🔒 **管理员命令：**
+**立即总结 / summarize**　— 立即触发知识归纳任务
+**重建知识库 / rebuild-kb** {名称}　— 清除并重建指定知识库
+**停止构建 / stop-build** {名称}　— 停止正在构建的知识库任务
+**恢复构建 / resume-build** {名称}　— 恢复中断的构建任务
+**查询知识库 / list-kb**　— 查看所有知识库状态
+**添加管理员 / add-admin** {用户ID}　— 添加管理员
+**移除管理员 / remove-admin** {用户ID}　— 移除管理员
+**enable-debug**　— 开启本群 Debug 模式
+**disable-debug**　— 关闭本群 Debug 模式
+
+💬 直接提问即可查询知识库"""
+        self.bot.send_card(chat_id, "帮助", help_text)
+
+    def _rag_query(self, chat_id: str, sender_id: str, question: str) -> None:
+        if not question:
+            return
+        self.bot.send_message(chat_id, "🔍 正在检索知识库...")
+        answer = rag_service.answer(chat_id, question, sender_id=sender_id)
+        self.bot.send_card(chat_id, "知识库回答", answer)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_admin(sender_id: str) -> bool:
+        with get_session() as session:
+            admin = session.execute(
+                select(AdminUser).where(AdminUser.sender_id == sender_id)
+            ).scalar_one_or_none()
+            return admin is not None
+
+    @staticmethod
+    def chat_has_kb_binding(chat_id: str) -> bool:
+        with get_session() as session:
+            binding = session.execute(
+                select(ChatKbBinding.id).where(
+                    ChatKbBinding.chat_id == chat_id,
+                    ChatKbBinding.deleted_at.is_(None),
+                ).limit(1)
+            ).scalar_one_or_none()
+            return binding is not None
+
+    def _async_history_compensate(self, chat_id: str) -> None:
+        """Trigger async history message fetch."""
+        def _run() -> None:
+            try:
+                from app.scheduler.tasks import compensate_history_for_chat
+                compensate_history_for_chat(chat_id)
+            except Exception:
+                logger.exception("History compensate failed for %s", chat_id)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _async_summarize(self, kb_id: int) -> None:
+        """Trigger async summarization for a KB."""
+        # Reset any previous cancellation and register a fresh event
+        clear_cancel_event(kb_id)
+        get_cancel_event(kb_id)
+
+        def _run() -> None:
+            try:
+                from app.services.message_analyzer import message_analyzer
+                message_analyzer.run_for_kb(kb_id)
+            except CancelledError:
+                logger.info("Summarize cancelled for kb_id=%d", kb_id)
+            except Exception:
+                logger.exception("Summarize failed for kb_id=%d", kb_id)
+            finally:
+                clear_cancel_event(kb_id)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _async_repo_analysis(self, repo_id: int, chat_id: str) -> None:
+        """Trigger async repo analysis."""
+        # Resolve kb_id for cancellation tracking
+        with get_session() as session:
+            repo = session.execute(
+                select(CodeRepo).where(CodeRepo.id == repo_id)
+            ).scalar_one_or_none()
+            kb_id = repo.kb_id if repo else None
+
+        if kb_id:
+            clear_cancel_event(kb_id)
+            get_cancel_event(kb_id)
+
+        def _run() -> None:
+            try:
+                from app.services.repo_analyzer import repo_analyzer
+                repo_analyzer.analyze_repo(repo_id, notify_chat_ids=[chat_id])
+            except CancelledError:
+                logger.info("Repo analysis cancelled for repo_id=%d", repo_id)
+            except Exception:
+                logger.exception("Repo analysis failed for repo_id=%d", repo_id)
+            finally:
+                if kb_id:
+                    clear_cancel_event(kb_id)
+
+        threading.Thread(target=_run, daemon=True).start()

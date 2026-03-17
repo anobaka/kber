@@ -1,0 +1,48 @@
+services:
+  # ---------- Infrastructure ----------
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD:-kber_secret}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-kber}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7.2
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  # ---------- Application ----------
+  kber:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    env_file:
+      - .env
+    environment:
+      MYSQL_HOST: mysql
+      MILVUS_HOST: host.docker.internal
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - repo_data:/data/repos
+
+volumes:
+  mysql_data:
+  redis_data:
+  repo_data:

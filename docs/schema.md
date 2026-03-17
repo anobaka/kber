@@ -72,6 +72,7 @@ CREATE TABLE chat_message (
     message_id VARCHAR(100) NOT NULL UNIQUE,
     parent_id VARCHAR(100) DEFAULT NULL COMMENT '飞书回复消息的 parent_message_id，用于话题分组',
     sender_id VARCHAR(100),
+    user_id VARCHAR(100) DEFAULT NULL COMMENT '飞书 user_id（工号）',
     content TEXT,
     msg_type VARCHAR(20) DEFAULT 'text',
     processed BOOLEAN DEFAULT FALSE COMMENT '是否已被归纳处理',
@@ -135,12 +136,18 @@ CREATE TABLE code_block (
     start_line INT,
     end_line INT,
     signature TEXT,
+    content_hash VARCHAR(64) COMMENT '代码内容的 SHA-256，用于检测变更',
     commit_hash VARCHAR(64),
+    description TEXT COMMENT 'LLM 生成的知识描述，在写入向量库前持久化',
+    status VARCHAR(20) NOT NULL DEFAULT 'pending' COMMENT 'pending / generated / success / failed',
+    error_message TEXT COMMENT '失败原因',
+    retry_count INT NOT NULL DEFAULT 0 COMMENT '已重试次数',
     milvus_id VARCHAR(100) COMMENT 'Milvus 中的向量 ID',
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     INDEX idx_repo_file (repo_id, file_path),
-    INDEX idx_commit (commit_hash)
+    INDEX idx_commit (commit_hash),
+    INDEX idx_repo_status (repo_id, status)
 );
 ```
 
@@ -177,6 +184,17 @@ CREATE TABLE summarize_error_log (
 );
 ```
 
+### 2.12 群设置
+
+```sql
+CREATE TABLE chat_settings (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    chat_id VARCHAR(100) NOT NULL UNIQUE COMMENT '飞书 chat_id',
+    debug_mode BOOLEAN DEFAULT FALSE COMMENT '是否开启 Debug 模式',
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+```
+
 ## 3. Milvus Collection
 
 ### 3.1 知识库 Collection
@@ -208,13 +226,33 @@ collection_schema = {
 
 **代码知识的额外 metadata**（使用 Milvus Dynamic Field）：
 
+`block_type` 取值：
+- `function` / `method` / `class` / `file` / `chunk` — 代码块级知识
+- `module_summary` — 模块（目录）级摘要
+- `repo_summary` — 仓库全局概览
+
 ```python
+# 代码块级
 {
     "file_path": "src/services/user_service.py",
     "language": "python",
     "block_type": "method",
     "block_name": "create_user",
     "commit_hash": "abc123f"
+}
+
+# 模块摘要级
+{
+    "file_path": "app/services",       # 模块目录路径
+    "block_type": "module_summary",
+    "block_name": "app/services"
+}
+
+# 仓库概览级
+{
+    "file_path": ".",
+    "block_type": "repo_summary",
+    "block_name": "overview"
 }
 ```
 
@@ -229,4 +267,5 @@ knowledge_base (1) ←── (N) summarize_task_log
 knowledge_base (1) ←── (N) summarize_error_log
 code_repo      (1) ←── (N) code_block
 chat [飞书群]   (1) ←── (N) chat_message
+chat [飞书群]   (1) ←── (1) chat_settings
 ```
