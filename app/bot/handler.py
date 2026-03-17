@@ -50,7 +50,7 @@ class FeishuBot:
         """Fetch the bot's own open_id via Feishu API (bot info endpoint)."""
         try:
             req = lark.BaseRequest()
-            req.http_method = "GET"
+            req.http_method = lark.HttpMethod.GET
             req.uri = "/open-apis/bot/v3/info"
             req.token_types = {lark.AccessTokenType.TENANT}
             resp = self.client.request(req)
