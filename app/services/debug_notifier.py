@@ -167,6 +167,24 @@ def notify_kb(kb_id: int, message: str) -> None:
         _send(chat_id, message)
 
 
+def notify_kb_all(kb_id: int, message: str) -> None:
+    """Send a message to **all** chats bound to a KB (regardless of debug mode)."""
+    with get_session() as session:
+        chat_ids = session.execute(
+            select(ChatKbBinding.chat_id).where(
+                ChatKbBinding.kb_id == kb_id,
+                ChatKbBinding.deleted_at.is_(None),
+            )
+        ).scalars().all()
+    if _send_fn is None:
+        return
+    for chat_id in chat_ids:
+        try:
+            _send_fn(chat_id, message)
+        except Exception:
+            logger.debug("Notify all failed for %s", chat_id, exc_info=True)
+
+
 def notify_repo(repo_id: int, message: str, *, progress: bool = False) -> None:
     """Send a debug message to all debug-enabled chats bound to a repo.
 

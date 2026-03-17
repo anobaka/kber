@@ -45,13 +45,15 @@ class MessageAnalyzer:
 
         Returns dict with counts: {new, updated, deleted, skipped}.
         """
-        from app.services.debug_notifier import notify_kb
+        from app.services.debug_notifier import notify_kb, notify_kb_all
 
         def _dbg(msg: str) -> None:
             notify_kb(kb_id, msg)
 
         task_log_id = self._start_task_log(kb_id, "scheduled")
         stats: dict[str, int] = {"new": 0, "updated": 0, "deleted": 0, "skipped": 0}
+        # Collect detailed change entries for the change notification
+        change_details: list[dict[str, str]] = []
 
         try:
             # Load unprocessed messages
@@ -99,9 +101,10 @@ class MessageAnalyzer:
             processed_msg_ids: list[str] = []
             for group in topic_groups:
                 check_cancelled(kb_id)
-                group_stats = self._process_topic_group(kb_id, group)
+                group_stats, group_entries = self._process_topic_group(kb_id, group)
                 for k in stats:
                     stats[k] += group_stats.get(k, 0)
+                change_details.extend(group_entries)
                 if group.get("should_process"):
                     processed_msg_ids.extend(group["message_ids"])
 
@@ -118,6 +121,10 @@ class MessageAnalyzer:
                 f"删除 {stats['deleted']}，跳过 {stats['skipped']}"
             )
 
+            # Send detailed change notification to all bound chats
+            if change_details:
+                notify_kb_all(kb_id, self._format_change_notification(change_details))
+
         except CancelledError:
             logger.info("Summarization cancelled for kb_id=%d", kb_id)
             self._finish_task_log(task_log_id, "failed", stats, "用户取消")
@@ -131,6 +138,39 @@ class MessageAnalyzer:
             raise
 
         return stats
+
+    # ------------------------------------------------------------------
+    # Change notification
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_change_notification(entries: list[dict[str, str]]) -> str:
+        """Build a human-readable knowledge change notification message."""
+        op_labels = {"新增": "新增", "更新": "更新", "删除": "删除"}
+        grouped: dict[str, list[dict[str, str]]] = {}
+        for e in entries:
+            op = e.get("operation", "新增")
+            grouped.setdefault(op, []).append(e)
+
+        lines: list[str] = ["📝 知识库变更通知"]
+        for op in ("新增", "更新", "删除"):
+            items = grouped.get(op)
+            if not items:
+                continue
+            label = op_labels.get(op, op)
+            lines.append(f"\n【{label}】")
+            for item in items:
+                topic = item.get("topic", "")
+                content = item.get("content", "")
+                certainty = item.get("certainty", "")
+                detail = f"• {topic}"
+                if content:
+                    detail += f"：{content}"
+                if certainty:
+                    detail += f"（{certainty}）"
+                lines.append(detail)
+
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -249,13 +289,20 @@ class MessageAnalyzer:
 
         return groups
 
-    def _process_topic_group(self, kb_id: int, group: dict[str, Any]) -> dict[str, int]:
-        """Judge status of topic group and summarize if ready."""
+    def _process_topic_group(
+        self, kb_id: int, group: dict[str, Any],
+    ) -> tuple[dict[str, int], list[dict[str, str]]]:
+        """Judge status of topic group and summarize if ready.
+
+        Returns (stats, processed_entries) where processed_entries contains
+        each knowledge entry dict enriched with its ``operation``.
+        """
         stats: dict[str, int] = {"new": 0, "updated": 0, "deleted": 0, "skipped": 0}
+        processed_entries: list[dict[str, str]] = []
         msgs = group.get("messages", [])
         if not msgs:
             group["should_process"] = True
-            return stats
+            return stats, processed_entries
 
         # Check if forced due to pending_count
         max_pending = max((m.get("pending_count", 0) for m in msgs), default=0)
@@ -290,7 +337,7 @@ class MessageAnalyzer:
             group["should_process"] = False
             self._increment_pending(group["message_ids"])
             stats["skipped"] = len(msgs)
-            return stats
+            return stats, processed_entries
 
         # Summarize this group
         group["should_process"] = True
@@ -300,7 +347,7 @@ class MessageAnalyzer:
             result = llm_service.summarize_topic(existing, discussion_text, status, conclusion)
 
             if "无新增知识" in result:
-                return stats
+                return stats, processed_entries
 
             entries = self._parse_knowledge_entries(result)
             for entry in entries:
@@ -308,18 +355,21 @@ class MessageAnalyzer:
                 if op == "新增":
                     self._insert_knowledge(kb_id, entry)
                     stats["new"] += 1
+                    processed_entries.append(entry)
                 elif op == "更新":
                     self._update_knowledge(kb_id, entry)
                     stats["updated"] += 1
+                    processed_entries.append(entry)
                 elif op == "删除":
                     self._delete_knowledge(kb_id, entry)
                     stats["deleted"] += 1
+                    processed_entries.append(entry)
 
         except Exception as e:
             logger.exception("Knowledge extraction failed for group %s", group.get("group_id"))
             self._log_error(kb_id, discussion_text, "", "extraction_error", str(e))
 
-        return stats
+        return stats, processed_entries
 
     def _parse_status(self, raw: str) -> tuple[str, str]:
         """Parse status judgment output. Returns (status, conclusion)."""
