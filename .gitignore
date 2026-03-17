@@ -209,3 +209,5 @@ __marimo__/
 
 # Jetbrains
 .idea/
+app/.DS_Store
+.DS_Store

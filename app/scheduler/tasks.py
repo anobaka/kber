@@ -15,6 +15,7 @@ from app.db.models import (
     KnowledgeBase,
 )
 from app.db.session import get_session
+from app.services.lock_service import kb_summarize_lock, repo_analysis_lock
 
 logger = logging.getLogger(__name__)
 
@@ -76,16 +77,22 @@ def run_message_summarization() -> None:
         ).scalars().all()
 
     for kb_id in kb_ids:
-        try:
-            stats = message_analyzer.run_for_kb(kb_id)
-            if any(v > 0 for v in stats.values()):
-                logger.info("Summarized kb_%d: %s", kb_id, stats)
-                # Run deflation after summarization
-                deflation_stats = knowledge_deflator.run(kb_id)
-                if any(v > 0 for v in deflation_stats.values()):
-                    logger.info("Deflated kb_%d: %s", kb_id, deflation_stats)
-        except Exception:
-            logger.exception("Summarization failed for kb_id=%d", kb_id)
+        # 使用分布式锁防止同一知识库被并发处理
+        with kb_summarize_lock(kb_id, timeout=600) as acquired:
+            if not acquired:
+                logger.info("kb_%d is already being processed by another worker, skip", kb_id)
+                continue
+
+            try:
+                stats = message_analyzer.run_for_kb(kb_id)
+                if any(v > 0 for v in stats.values()):
+                    logger.info("Summarized kb_%d: %s", kb_id, stats)
+                    # Run deflation after summarization
+                    deflation_stats = knowledge_deflator.run(kb_id)
+                    if any(v > 0 for v in deflation_stats.values()):
+                        logger.info("Deflated kb_%d: %s", kb_id, deflation_stats)
+            except Exception:
+                logger.exception("Summarization failed for kb_id=%d", kb_id)
 
 
 # ------------------------------------------------------------------
@@ -164,10 +171,16 @@ def run_code_update_check() -> None:
         ).scalars().all()
 
     for repo in repos:
-        try:
-            # check_and_update → analyze_repo, which uses notify_repo internally
-            stats = repo_analyzer.check_and_update(repo.id)
-            if stats.get("knowledge_generated", 0) > 0:
-                logger.info("Updated repo %d: %s", repo.id, stats)
-        except Exception:
-            logger.exception("Code update check failed for repo_id=%d", repo.id)
+        # 使用分布式锁防止同一代码库被并发分析
+        with repo_analysis_lock(repo.id, timeout=1800) as acquired:
+            if not acquired:
+                logger.info("repo_%d is already being analyzed by another worker, skip", repo.id)
+                continue
+
+            try:
+                # check_and_update → analyze_repo, which uses notify_repo internally
+                stats = repo_analyzer.check_and_update(repo.id)
+                if stats.get("knowledge_generated", 0) > 0:
+                    logger.info("Updated repo %d: %s", repo.id, stats)
+            except Exception:
+                logger.exception("Code update check failed for repo_id=%d", repo.id)
