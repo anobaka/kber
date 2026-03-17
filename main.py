@@ -7,12 +7,31 @@ import logging
 import os
 import signal
 import sys
+from logging.handlers import RotatingFileHandler
+
+# Ensure log directory exists
+LOG_DIR = os.getenv("LOG_DIR", "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+_log_fmt = "%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s"
+_log_datefmt = "%Y-%m-%d %H:%M:%S"
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    format=_log_fmt,
+    datefmt=_log_datefmt,
 )
+
+# File handler – 10 MB per file, keep 5 backups
+_file_handler = RotatingFileHandler(
+    os.path.join(LOG_DIR, "kber.log"),
+    maxBytes=10 * 1024 * 1024,
+    backupCount=5,
+    encoding="utf-8",
+)
+_file_handler.setFormatter(logging.Formatter(fmt=_log_fmt, datefmt=_log_datefmt))
+_file_handler.setLevel(logging.DEBUG)
+logging.getLogger().addHandler(_file_handler)
 logger = logging.getLogger("kber")
 
 
@@ -27,17 +46,15 @@ def main() -> None:
     from alembic.config import Config as AlembicConfig
     alembic_cfg = AlembicConfig("alembic.ini")
     command.upgrade(alembic_cfg, "head")
-    # Alembic's fileConfig resets root logger – restore level and format.
+    # Alembic's fileConfig resets root logger – restore level, format, and file handler.
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
-    formatter = logging.Formatter(
-        fmt="%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    root_logger.setLevel(logging.DEBUG)
+    formatter = logging.Formatter(fmt=_log_fmt, datefmt=_log_datefmt)
     for h in root_logger.handlers:
         h.setFormatter(formatter)
-    # Alembic's fileConfig resets root logger level to WARNING; restore it.
-    logging.getLogger().setLevel(logging.DEBUG)
+    # Re-add file handler if Alembic removed it
+    if _file_handler not in root_logger.handlers:
+        root_logger.addHandler(_file_handler)
 
     # Connect to Milvus
     logger.info("Connecting to Milvus...")
