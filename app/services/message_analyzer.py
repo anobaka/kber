@@ -163,6 +163,7 @@ class MessageAnalyzer:
                     "message_id": r.message_id,
                     "chat_id": r.chat_id,
                     "sender_id": r.sender_id,
+                    "user_id": getattr(r, "user_id", None) or "",
                     "content": r.content or "",
                     "created_at": r.created_at,
                     "parent_id": r.parent_id,
@@ -189,7 +190,8 @@ class MessageAnalyzer:
         lines: list[str] = []
         for m in messages:
             ts = m["created_at"].strftime("%Y-%m-%d %H:%M") if isinstance(m["created_at"], datetime) else str(m["created_at"])
-            lines.append(f"[{ts}] (ID:{m['message_id']}) {m['sender_id']}: {m['content']}")
+            display_id = m.get("user_id") or m["sender_id"]
+            lines.append(f"[{ts}] (ID:{m['message_id']}) {display_id}: {m['content']}")
         return "\n".join(lines)
 
     def _group_topics(self, messages: list[dict[str, Any]], messages_text: str) -> list[dict[str, Any]]:

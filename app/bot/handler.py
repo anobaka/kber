@@ -118,8 +118,23 @@ class FeishuBot:
                 logger.debug("Duplicate message ignored: %s", message_id)
                 return
 
+            # Log full sender structure for debugging
+            sender = event.event.sender
+            sender_id_obj = sender.sender_id if sender else None
+            logger.debug(
+                "Message %s sender structure: sender_id=%s, sender_type=%s, "
+                "open_id=%s, user_id=%s, union_id=%s",
+                message_id,
+                sender_id_obj,
+                getattr(sender, "sender_type", None),
+                getattr(sender_id_obj, "open_id", None),
+                getattr(sender_id_obj, "user_id", None),
+                getattr(sender_id_obj, "union_id", None),
+            )
+
             msg_type = msg.message_type
-            sender_id = event.event.sender.sender_id.open_id
+            sender_id = sender_id_obj.open_id if sender_id_obj else ""
+            user_id = getattr(sender_id_obj, "user_id", None) or ""
 
             # Parse message content
             content_str = msg.content
@@ -149,10 +164,10 @@ class FeishuBot:
 
             if is_at_bot or msg.chat_type == "p2p":
                 # This is a command or question directed at the bot
-                router.handle(chat_id, message_id, sender_id, text)
+                router.handle(chat_id, message_id, sender_id, text, user_id=user_id)
             else:
                 # Regular group message (including @others) – collect for knowledge base
-                self._collect_message(chat_id, message_id, sender_id, text, msg_type, parent_id)
+                self._collect_message(chat_id, message_id, sender_id, user_id, text, msg_type, parent_id)
 
         except Exception:
             logger.exception("Error handling message event")
@@ -162,6 +177,7 @@ class FeishuBot:
         chat_id: str,
         message_id: str,
         sender_id: str,
+        user_id: str,
         content: str,
         msg_type: str,
         parent_id: str | None,
@@ -191,6 +207,7 @@ class FeishuBot:
                     message_id=message_id,
                     parent_id=parent_id,
                     sender_id=sender_id,
+                    user_id=user_id or None,
                     content=content,
                     msg_type=msg_type,
                 ))
@@ -307,10 +324,16 @@ class FeishuBot:
                 for item in items:
                     try:
                         content_json = json.loads(item.body.content) if item.body and item.body.content else {}
+                        # Extract sender info – structure may vary by API version
+                        item_sender = item.sender if item else None
+                        item_sender_id = getattr(item_sender, "id", None) if item_sender else None
+                        logger.debug(
+                            "History item sender structure: %s", item_sender,
+                        )
                         messages.append({
                             "message_id": item.message_id,
                             "chat_id": chat_id,
-                            "sender_id": item.sender.id if item.sender else None,
+                            "sender_id": item_sender_id,
                             "content": content_json.get("text", ""),
                             "msg_type": item.msg_type,
                             "parent_id": item.parent_id,

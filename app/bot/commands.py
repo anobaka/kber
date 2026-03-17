@@ -96,7 +96,7 @@ class CommandRouter:
         ({"查询知识库", "list-kb"}, "_query_kb_status"),
     ]
 
-    def handle(self, chat_id: str, message_id: str, sender_id: str, text: str) -> None:
+    def handle(self, chat_id: str, message_id: str, sender_id: str, text: str, *, user_id: str = "") -> None:
         """Parse command prefix and dispatch."""
         text = text.strip()
 
@@ -120,7 +120,10 @@ class CommandRouter:
         elif text in ("disable-debug",):
             self._set_debug(chat_id, sender_id, False)
         elif text.lower() in ("我的id", "myid"):
-            self.bot.send_message(chat_id, f"你的用户 ID：`{sender_id}`")
+            id_msg = f"你的用户 ID：`{sender_id}`"
+            if user_id:
+                id_msg += f"\n你的工号：`{user_id}`"
+            self.bot.send_message(chat_id, id_msg)
         elif text.lower() in ("帮助", "help"):
             self._show_help(chat_id)
         else:

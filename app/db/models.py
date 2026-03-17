@@ -84,6 +84,7 @@ class ChatMessage(Base):
     message_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
     parent_id: Mapped[Optional[str]] = mapped_column(String(100))
     sender_id: Mapped[Optional[str]] = mapped_column(String(100))
+    user_id: Mapped[Optional[str]] = mapped_column(String(100), comment="Feishu user_id (employee number)")
     content: Mapped[Optional[str]] = mapped_column(Text)
     msg_type: Mapped[str] = mapped_column(String(20), default="text")
     processed: Mapped[bool] = mapped_column(Boolean, default=False)
