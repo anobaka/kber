@@ -239,6 +239,8 @@ class FeishuBot:
                 content = json.dumps({"text": text})
             elif msg_type == "interactive":
                 content = text  # Already JSON
+            elif msg_type == "post":
+                content = text  # Already JSON (post structure)
             else:
                 content = json.dumps({"text": text})
 
@@ -303,18 +305,20 @@ class FeishuBot:
         return json.dumps(card)
 
     def send_card(self, chat_id: str, title: str, content: str) -> None:
-        """Send an interactive card message."""
-        card = {
-            "config": {"wide_screen_mode": True},
-            "header": {
-                "title": {"tag": "plain_text", "content": title},
-                "template": "blue",
+        """Send a rich-text post message with Markdown rendering.
+
+        Uses Feishu ``post`` msg_type with the ``md`` tag for full
+        Markdown support (bold, italic, code blocks, lists, links, etc.).
+        """
+        post = {
+            "zh_cn": {
+                "title": title,
+                "content": [
+                    [{"tag": "md", "text": content}],
+                ],
             },
-            "elements": [
-                {"tag": "markdown", "content": content},
-            ],
         }
-        self.send_message(chat_id, json.dumps(card), msg_type="interactive")
+        self.send_message(chat_id, json.dumps(post), msg_type="post")
 
     def fetch_history_messages(self, chat_id: str, page_size: int = 50) -> list[dict[str, Any]]:
         """Fetch historical messages from a chat for compensation."""
