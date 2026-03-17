@@ -237,6 +237,24 @@ class MilvusService:
         )
         return results
 
+    def get_existing_topics(self, kb_id: int, limit: int = 16384) -> set[str]:
+        """Return the set of topic values present in a collection.
+
+        Used to detect orphaned blocks (marked success in DB but missing
+        from Milvus).
+        """
+        self.connect()
+        name = self._collection_name(kb_id)
+        if not utility.has_collection(name):
+            return set()
+        col = Collection(name)
+        results = col.query(
+            expr='source == "code"',
+            output_fields=["topic"],
+            limit=limit,
+        )
+        return {r["topic"] for r in results}
+
     def drop_collection(self, kb_id: int) -> None:
         """Drop a collection entirely."""
         self.connect()

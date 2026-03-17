@@ -598,13 +598,30 @@ class CommandRouter:
             lines = [f"📚 知识库列表（共 {len(kbs)} 个）\n"]
 
             for i, kb in enumerate(kbs, 1):
-                # Count bindings
-                binding_count = session.execute(
-                    select(func.count()).select_from(ChatKbBinding).where(
-                        ChatKbBinding.kb_id == kb.id,
-                        ChatKbBinding.deleted_at.is_(None),
-                    )
-                ).scalar() or 0
+                # Count bindings – code KBs use ChatRepoBinding, others use ChatKbBinding
+                if kb.kb_type == "code":
+                    code_repo = session.execute(
+                        select(CodeRepo).where(
+                            CodeRepo.kb_id == kb.id,
+                            CodeRepo.deleted_at.is_(None),
+                        )
+                    ).scalar_one_or_none()
+                    if code_repo:
+                        binding_count = session.execute(
+                            select(func.count()).select_from(ChatRepoBinding).where(
+                                ChatRepoBinding.repo_id == code_repo.id,
+                                ChatRepoBinding.deleted_at.is_(None),
+                            )
+                        ).scalar() or 0
+                    else:
+                        binding_count = 0
+                else:
+                    binding_count = session.execute(
+                        select(func.count()).select_from(ChatKbBinding).where(
+                            ChatKbBinding.kb_id == kb.id,
+                            ChatKbBinding.deleted_at.is_(None),
+                        )
+                    ).scalar() or 0
 
                 # Count Milvus entries
                 try:
@@ -630,15 +647,16 @@ class CommandRouter:
                     else:
                         last_time = f"{int(delta.days)} 天前"
 
-                # Code repo info
+                # Code repo info (code_repo already queried above for code KBs)
                 code_info = ""
                 if kb.kb_type == "code":
-                    code_repo = session.execute(
-                        select(CodeRepo).where(
-                            CodeRepo.kb_id == kb.id,
-                            CodeRepo.deleted_at.is_(None),
-                        )
-                    ).scalar_one_or_none()
+                    if not code_repo:
+                        code_repo = session.execute(
+                            select(CodeRepo).where(
+                                CodeRepo.kb_id == kb.id,
+                                CodeRepo.deleted_at.is_(None),
+                            )
+                        ).scalar_one_or_none()
                     if code_repo:
                         code_info = f"\n   代码库：{code_repo.git_url}"
 

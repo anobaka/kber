@@ -307,6 +307,11 @@ class RepoAnalyzer:
                 repo_id, new_blocks, current_commit, changed_files,
             )
 
+            # Repair orphaned blocks (success in DB but missing from Milvus)
+            repaired = self._repair_orphaned_blocks(repo_id, kb_id)
+            if repaired:
+                _notify(f"🔧 发现 {repaired} 个孤儿代码块（之前中断导致），已重置为待处理", progress=True)
+
             # Also pick up failed / orphaned-pending blocks from previous runs
             existing_cb_ids = {b["_cb_id"] for b in blocks_to_generate if b.get("_cb_id")}
             retry_blocks = self._load_failed_blocks(repo_id, exclude_ids=existing_cb_ids)
@@ -827,6 +832,55 @@ class RepoAnalyzer:
                     retry_count=CodeBlock.retry_count + 1,
                 )
             )
+
+    def _repair_orphaned_blocks(self, repo_id: int, kb_id: int) -> int:
+        """Detect and reset 'success' blocks that have no data in Milvus.
+
+        This can happen when a previous run was interrupted after LLM
+        generation but before Milvus write completed.  Such blocks are
+        marked ``success`` in MySQL but have no corresponding Milvus
+        entry, causing them to be skipped on subsequent runs.
+
+        Returns the number of blocks reset to ``pending``.
+        """
+        with get_session() as session:
+            success_blocks = session.execute(
+                select(CodeBlock).where(
+                    CodeBlock.repo_id == repo_id,
+                    CodeBlock.status == "success",
+                )
+            ).scalars().all()
+
+            if not success_blocks:
+                return 0
+
+            # Get topics present in Milvus for this KB
+            milvus_topics = milvus_service.get_existing_topics(kb_id)
+
+            orphaned_ids: list[int] = []
+            for block in success_blocks:
+                topic = f"{block.file_path}:{block.block_name or ''}"
+                if topic not in milvus_topics:
+                    orphaned_ids.append(block.id)
+
+            if orphaned_ids:
+                session.execute(
+                    update(CodeBlock)
+                    .where(CodeBlock.id.in_(orphaned_ids))
+                    .values(status="pending", retry_count=0, error_message=None)
+                )
+                logger.info(
+                    "Repaired %d orphaned blocks (success in DB but missing from Milvus) "
+                    "for repo %d — reset to pending",
+                    len(orphaned_ids), repo_id,
+                )
+            else:
+                logger.debug(
+                    "No orphaned blocks found for repo %d (%d success blocks all in Milvus)",
+                    repo_id, len(success_blocks),
+                )
+
+            return len(orphaned_ids)
 
     # ================================================================== #
     #  Block-level knowledge generation                                    #
