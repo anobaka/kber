@@ -1,9 +1,8 @@
 """Feishu bot event handler – receives messages via WebSocket long connection."""
 
-import collections
 import json
 import logging
-import threading
+import time
 from typing import Any
 
 import lark_oapi as lark
@@ -28,11 +27,13 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
 from app.config import config
 from app.db.models import ChatMessage, ResponseFeedback
 from app.db.session import get_session
+from app.services.lock_service import get_redis_client
 
 logger = logging.getLogger(__name__)
 
 
-_DEDUP_MAX = 1024
+_DEDUP_MAX = 1000  # Redis ZSet 去重窗口大小
+_DEDUP_KEY = "kber:message_dedup"
 
 
 class FeishuBot:
@@ -42,8 +43,6 @@ class FeishuBot:
         self._client: lark.Client | None = None
         self._ws_client: Any = None
         self._bot_open_id: str | None = None
-        self._seen_msg_ids: collections.OrderedDict[str, None] = collections.OrderedDict()
-        self._seen_lock = threading.Lock()
 
     @property
     def client(self) -> lark.Client:
@@ -117,13 +116,43 @@ class FeishuBot:
         self._ws_client.start()
 
     def _is_duplicate(self, message_id: str) -> bool:
-        """Return True if this message_id was already seen (LRU dedup)."""
-        with self._seen_lock:
-            if message_id in self._seen_msg_ids:
-                return True
-            self._seen_msg_ids[message_id] = None
-            if len(self._seen_msg_ids) > _DEDUP_MAX:
-                self._seen_msg_ids.popitem(last=False)
+        """
+        使用 Redis ZSet 判断消息是否重复
+        保留最近 _DEDUP_MAX 条消息，自动清理过期数据
+        """
+        try:
+            redis_client = get_redis_client()
+            now = time.time()
+
+            # 使用管道保证原子性
+            pipe = redis_client.pipeline()
+
+            # 1. 检查消息是否已存在（ZSCORE 查询，O(log N)）
+            pipe.zscore(_DEDUP_KEY, message_id)
+
+            # 2. 添加新消息（使用当前时间戳作为 score）
+            pipe.zadd(_DEDUP_KEY, {message_id: now})
+
+            # 3. 只保留最近的 _DEDUP_MAX 条消息（按 score 排序，删除旧的）
+            # ZREMRANGEBYRANK 删除排名 0 到 -(N+1) 的元素，即只保留最后 N 条
+            pipe.zremrangebyrank(_DEDUP_KEY, 0, -(_DEDUP_MAX + 1))
+
+            # 4. 设置过期时间（防止冷数据残留，7天）
+            pipe.expire(_DEDUP_KEY, 7 * 24 * 3600)
+
+            results = pipe.execute()
+
+            # results[0] 是 zscore 返回值，不为 None 表示已存在
+            is_dup = results[0] is not None
+
+            if is_dup:
+                logger.debug("Duplicate message ignored: %s", message_id)
+
+            return is_dup
+
+        except Exception as e:
+            # Redis 异常时，允许消息通过（避免阻塞），但记录错误
+            logger.error("Redis dedup check failed: %s", e)
             return False
 
     def _on_message(self, ctx: Any, event: Any, router: Any) -> None:
@@ -317,8 +346,14 @@ class FeishuBot:
         }
         return json.dumps(card)
 
-    def send_card(self, chat_id: str, title: str, content: str) -> str | None:
+    def send_card(self, chat_id: str, title: str, content: str, message_id: str | None = None) -> str | None:
         """Send an interactive card with JSON 2.0 Markdown rendering.
+
+        Args:
+            chat_id: The chat ID to send to
+            title: Card title
+            content: Markdown content
+            message_id: If provided, reply to this message; otherwise send as new message
 
         Returns the message_id on success.
         """
@@ -335,20 +370,33 @@ class FeishuBot:
                 ],
             },
         }
-        return self.send_message(chat_id, json.dumps(card), msg_type="interactive")
+        card_json = json.dumps(card)
+        if message_id:
+            return self.reply_message(message_id, card_json, msg_type="interactive")
+        return self.send_message(chat_id, card_json, msg_type="interactive")
 
     def send_rag_answer_card(
         self,
         chat_id: str,
         question: str,
         answer: str,
+        message_id: str | None = None,
     ) -> str | None:
         """Send an interactive card with the RAG answer and feedback buttons.
+
+        Args:
+            chat_id: The chat ID to send to
+            question: The original question
+            answer: The RAG answer markdown content
+            message_id: If provided, reply to this message; otherwise send as new message
 
         Returns the message_id of the sent card for feedback tracking.
         """
         card = self._build_rag_answer_card(answer, question)
-        return self.send_message(chat_id, json.dumps(card), msg_type="interactive")
+        card_json = json.dumps(card)
+        if message_id:
+            return self.reply_message(message_id, card_json, msg_type="interactive")
+        return self.send_message(chat_id, card_json, msg_type="interactive")
 
     @staticmethod
     def _build_rag_answer_card(

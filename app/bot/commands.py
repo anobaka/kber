@@ -105,40 +105,40 @@ class CommandRouter:
             for prefix in (cn, en):
                 if text.startswith(prefix):
                     arg = text[len(prefix):].strip()
-                    getattr(self, method)(chat_id, sender_id, arg)
+                    getattr(self, method)(chat_id, message_id, sender_id, arg)
                     return
 
         # Exact-match commands (no parameter)
         for aliases, method in self._EXACT_COMMANDS:
             if text in aliases:
-                getattr(self, method)(chat_id, sender_id)
+                getattr(self, method)(chat_id, message_id, sender_id)
                 return
 
         # Special cases
         if text in ("enable-debug",):
-            self._set_debug(chat_id, sender_id, True)
+            self._set_debug(chat_id, message_id, sender_id, True)
         elif text in ("disable-debug",):
-            self._set_debug(chat_id, sender_id, False)
+            self._set_debug(chat_id, message_id, sender_id, False)
         elif text.lower() in ("我的id", "myid"):
-            id_msg = f"你的用户 ID：`{sender_id}`"
+            id_msg = f"你的用户 ID：{sender_id}"
             if user_id:
-                id_msg += f"\n你的工号：`{user_id}`"
-            self.bot.send_message(chat_id, id_msg)
+                id_msg += f"\n你的工号：{user_id}"
+            self.bot.reply_message(message_id, id_msg)
         elif text.lower() in ("清空上下文", "clear-context"):
-            self._clear_context(chat_id)
+            self._clear_context(chat_id, message_id)
         elif text.lower() in ("帮助", "help"):
-            self._show_help(chat_id)
+            self._show_help(chat_id, message_id)
         else:
             # Free-form question → RAG
-            self._rag_query(chat_id, sender_id, text)
+            self._rag_query(chat_id, message_id, sender_id, text)
 
     # ------------------------------------------------------------------
     # Command handlers
     # ------------------------------------------------------------------
 
-    def _bind_kb(self, chat_id: str, sender_id: str, kb_name: str) -> None:
+    def _bind_kb(self, chat_id: str, message_id: str, sender_id: str, kb_name: str) -> None:
         if not kb_name:
-            self.bot.send_message(chat_id, "⚠️ 知识库名称不能为空，请使用格式：绑定知识库 {名称} / bind-kb {name}")
+            self.bot.reply_message(message_id, "⚠️ 知识库名称不能为空，请使用格式：绑定知识库 {名称} / bind-kb {name}")
             return
 
         with get_session() as session:
@@ -169,7 +169,7 @@ class CommandRouter:
             ).scalar_one_or_none()
 
             if existing:
-                self.bot.send_message(chat_id, f"ℹ️ 本群已绑定到知识库「{kb_name}」。")
+                self.bot.reply_message(message_id, f"ℹ️ 本群已绑定到知识库「{kb_name}」。")
                 return
 
             session.add(ChatKbBinding(chat_id=chat_id, kb_id=kb.id))
@@ -180,14 +180,14 @@ class CommandRouter:
             if not kb.milvus_collection:
                 kb.milvus_collection = f"kb_{kb.id}"
 
-        self.bot.send_message(chat_id, f"✅ 已将本群绑定到知识库「{kb_name}」，正在拉取历史消息...")
+        self.bot.reply_message(message_id, f"✅ 已将本群绑定到知识库「{kb_name}」，正在拉取历史消息...")
 
         # Trigger async history fetch
         self._async_history_compensate(chat_id)
 
-    def _unbind_kb(self, chat_id: str, sender_id: str, kb_name: str) -> None:
+    def _unbind_kb(self, chat_id: str, message_id: str, sender_id: str, kb_name: str) -> None:
         if not kb_name:
-            self.bot.send_message(chat_id, "⚠️ 知识库名称不能为空，请使用格式：解绑知识库 {名称} / unbind-kb {name}")
+            self.bot.reply_message(message_id, "⚠️ 知识库名称不能为空，请使用格式：解绑知识库 {名称} / unbind-kb {name}")
             return
 
         with get_session() as session:
@@ -199,7 +199,7 @@ class CommandRouter:
             ).scalar_one_or_none()
 
             if not kb:
-                self.bot.send_message(chat_id, f"⚠️ 知识库「{kb_name}」不存在。")
+                self.bot.reply_message(message_id, f"⚠️ 知识库「{kb_name}」不存在。")
                 return
 
             binding = session.execute(
@@ -211,14 +211,14 @@ class CommandRouter:
             ).scalar_one_or_none()
 
             if not binding:
-                self.bot.send_message(chat_id, f"⚠️ 本群未绑定知识库「{kb_name}」。")
+                self.bot.reply_message(message_id, f"⚠️ 本群未绑定知识库「{kb_name}」。")
                 return
 
             binding.deleted_at = datetime.utcnow()
 
-        self.bot.send_message(chat_id, f"✅ 已解绑知识库「{kb_name}」，后续消息将不再纳入该知识库。")
+        self.bot.reply_message(message_id, f"✅ 已解绑知识库「{kb_name}」，后续消息将不再纳入该知识库。")
 
-    def _bind_repo(self, chat_id: str, sender_id: str, git_url: str) -> None:
+    def _bind_repo(self, chat_id: str, message_id: str, sender_id: str, git_url: str) -> None:
         if not git_url:
             self.bot.send_message(
                 chat_id,
@@ -227,7 +227,7 @@ class CommandRouter:
             return
 
         if not GIT_REPO_PATTERN.match(git_url):
-            self.bot.send_message(chat_id, "⚠️ 格式不正确，请使用 org/repo 或 https://... 格式。")
+            self.bot.reply_message(message_id, "⚠️ 格式不正确，请使用 org/repo 或 https://... 格式。")
             return
 
         git_url = normalize_git_url(git_url)
@@ -279,20 +279,20 @@ class CommandRouter:
             ).scalar_one_or_none()
 
             if existing:
-                self.bot.send_message(chat_id, f"ℹ️ 本群已绑定该代码库。")
+                self.bot.reply_message(message_id, f"ℹ️ 本群已绑定该代码库。")
                 return
 
             session.add(ChatRepoBinding(chat_id=chat_id, repo_id=repo.id))
             repo_id = repo.id
 
-        self.bot.send_message(chat_id, f"✅ 已绑定代码库「{git_url}」，正在克隆并分析代码，请稍候...")
+        self.bot.reply_message(message_id, f"✅ 已绑定代码库「{git_url}」，正在克隆并分析代码，请稍候...")
 
         # Trigger async full analysis
         self._async_repo_analysis(repo_id, chat_id)
 
-    def _unbind_repo(self, chat_id: str, sender_id: str, git_url: str) -> None:
+    def _unbind_repo(self, chat_id: str, message_id: str, sender_id: str, git_url: str) -> None:
         if not git_url:
-            self.bot.send_message(chat_id, "⚠️ 代码库地址不能为空。")
+            self.bot.reply_message(message_id, "⚠️ 代码库地址不能为空。")
             return
 
         git_url = normalize_git_url(git_url)
@@ -306,7 +306,7 @@ class CommandRouter:
             ).scalar_one_or_none()
 
             if not repo:
-                self.bot.send_message(chat_id, "⚠️ 未找到该代码库。")
+                self.bot.reply_message(message_id, "⚠️ 未找到该代码库。")
                 return
 
             binding = session.execute(
@@ -318,14 +318,14 @@ class CommandRouter:
             ).scalar_one_or_none()
 
             if not binding:
-                self.bot.send_message(chat_id, "⚠️ 本群未绑定该代码库。")
+                self.bot.reply_message(message_id, "⚠️ 本群未绑定该代码库。")
                 return
 
             binding.deleted_at = datetime.utcnow()
 
-        self.bot.send_message(chat_id, f"✅ 已解绑代码库「{git_url}」。")
+        self.bot.reply_message(message_id, f"✅ 已解绑代码库「{git_url}」。")
 
-    def _add_knowledge(self, chat_id: str, sender_id: str, content: str) -> None:
+    def _add_knowledge(self, chat_id: str, message_id: str, sender_id: str, content: str) -> None:
         if not content:
             self.bot.send_message(
                 chat_id,
@@ -347,7 +347,7 @@ class CommandRouter:
             ).scalars().all()
 
             if not bound_kbs:
-                self.bot.send_message(chat_id, "⚠️ 本群尚未绑定非代码知识库，请先发送「绑定知识库 {名称}」/ 「bind-kb {name}」进行绑定。")
+                self.bot.reply_message(message_id, "⚠️ 本群尚未绑定非代码知识库，请先发送「绑定知识库 {名称}」/ 「bind-kb {name}」进行绑定。")
                 return
 
             # Try to parse optional KB name: first word might be a KB name
@@ -358,7 +358,7 @@ class CommandRouter:
                 target_kb_name = first_word
                 content = content[len(first_word):].strip()
                 if not content:
-                    self.bot.send_message(chat_id, "⚠️ 知识内容不能为空。")
+                    self.bot.reply_message(message_id, "⚠️ 知识内容不能为空。")
                     return
                 target_kb = next(kb for kb in bound_kbs if kb.name == target_kb_name)
 
@@ -376,7 +376,7 @@ class CommandRouter:
                     return
 
             if len(content) > 5000:
-                self.bot.send_message(chat_id, "⚠️ 知识内容过长，请控制在 5000 字符以内。")
+                self.bot.reply_message(message_id, "⚠️ 知识内容过长，请控制在 5000 字符以内。")
                 return
 
             session.add(ManualKnowledge(
@@ -388,12 +388,12 @@ class CommandRouter:
             kb_id = target_kb.id
             kb_name = target_kb.name
 
-        self.bot.send_message(chat_id, f"✅ 知识已添加到「{kb_name}」，正在归纳整合中。")
+        self.bot.reply_message(message_id, f"✅ 知识已添加到「{kb_name}」，正在归纳整合中。")
         self._async_summarize(kb_id)
 
-    def _force_summarize(self, chat_id: str, sender_id: str) -> None:
+    def _force_summarize(self, chat_id: str, message_id: str, sender_id: str) -> None:
         if not self._is_admin(sender_id):
-            self.bot.send_message(chat_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
+            self.bot.reply_message(message_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
             return
 
         with get_session() as session:
@@ -420,7 +420,7 @@ class CommandRouter:
             ).scalars().all()
 
         if not kbs and not repos:
-            self.bot.send_message(chat_id, "⚠️ 本群尚未绑定任何知识库或代码库。")
+            self.bot.reply_message(message_id, "⚠️ 本群尚未绑定任何知识库或代码库。")
             return
 
         parts = []
@@ -430,20 +430,20 @@ class CommandRouter:
         if repos:
             urls = "、".join(f"「{r.git_url}」" for r in repos)
             parts.append(f"代码库 {urls}")
-        self.bot.send_message(chat_id, f"🔄 正在归纳 {'，'.join(parts)}，请稍候...")
+        self.bot.reply_message(message_id, f"🔄 正在归纳 {'，'.join(parts)}，请稍候...")
 
         for kb in kbs:
             self._async_summarize(kb.id)
         for repo in repos:
             self._async_repo_analysis(repo.id, chat_id)
 
-    def _rebuild_kb(self, chat_id: str, sender_id: str, kb_name: str) -> None:
+    def _rebuild_kb(self, chat_id: str, message_id: str, sender_id: str, kb_name: str) -> None:
         if not self._is_admin(sender_id):
-            self.bot.send_message(chat_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
+            self.bot.reply_message(message_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
             return
 
         if not kb_name:
-            self.bot.send_message(chat_id, "⚠️ 请指定知识库名称，格式：重建知识库 {名称} / rebuild-kb {name}")
+            self.bot.reply_message(message_id, "⚠️ 请指定知识库名称，格式：重建知识库 {名称} / rebuild-kb {name}")
             return
 
         with get_session() as session:
@@ -455,7 +455,7 @@ class CommandRouter:
             ).scalar_one_or_none()
 
             if not kb:
-                self.bot.send_message(chat_id, f"⚠️ 未找到知识库「{kb_name}」。")
+                self.bot.reply_message(message_id, f"⚠️ 未找到知识库「{kb_name}」。")
                 return
 
             kb_id = kb.id
@@ -504,20 +504,20 @@ class CommandRouter:
         except Exception as e:
             logger.warning("Failed to reset Milvus collection for kb_%d: %s", kb_id, e)
 
-        self.bot.send_message(chat_id, f"🔄 正在重建知识库「{kb_name}」（类型：{kb_type}），已清除旧数据...")
+        self.bot.reply_message(message_id, f"🔄 正在重建知识库「{kb_name}」（类型：{kb_type}），已清除旧数据...")
 
         if kb_type == "code" and repo_id:
             self._async_repo_analysis(repo_id, chat_id)
         else:
             self._async_summarize(kb_id)
 
-    def _stop_build(self, chat_id: str, sender_id: str, kb_name: str) -> None:
+    def _stop_build(self, chat_id: str, message_id: str, sender_id: str, kb_name: str) -> None:
         if not self._is_admin(sender_id):
-            self.bot.send_message(chat_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
+            self.bot.reply_message(message_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
             return
 
         if not kb_name:
-            self.bot.send_message(chat_id, "⚠️ 请指定知识库名称，格式：停止构建 {名称} / stop-build {name}")
+            self.bot.reply_message(message_id, "⚠️ 请指定知识库名称，格式：停止构建 {名称} / stop-build {name}")
             return
 
         with get_session() as session:
@@ -529,24 +529,24 @@ class CommandRouter:
             ).scalar_one_or_none()
 
         if not kb:
-            self.bot.send_message(chat_id, f"⚠️ 未找到知识库「{kb_name}」。")
+            self.bot.reply_message(message_id, f"⚠️ 未找到知识库「{kb_name}」。")
             return
 
         ev = get_cancel_event(kb.id)
         if ev.is_set():
-            self.bot.send_message(chat_id, f"ℹ️ 知识库「{kb_name}」的构建任务已在停止中。")
+            self.bot.reply_message(message_id, f"ℹ️ 知识库「{kb_name}」的构建任务已在停止中。")
             return
 
         ev.set()
-        self.bot.send_message(chat_id, f"🛑 正在停止知识库「{kb_name}」的构建任务...")
+        self.bot.reply_message(message_id, f"🛑 正在停止知识库「{kb_name}」的构建任务...")
 
-    def _resume_build(self, chat_id: str, sender_id: str, kb_name: str) -> None:
+    def _resume_build(self, chat_id: str, message_id: str, sender_id: str, kb_name: str) -> None:
         if not self._is_admin(sender_id):
-            self.bot.send_message(chat_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
+            self.bot.reply_message(message_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
             return
 
         if not kb_name:
-            self.bot.send_message(chat_id, "⚠️ 请指定知识库名称，格式：恢复构建 {名称} / resume-build {name}")
+            self.bot.reply_message(message_id, "⚠️ 请指定知识库名称，格式：恢复构建 {名称} / resume-build {name}")
             return
 
         with get_session() as session:
@@ -558,7 +558,7 @@ class CommandRouter:
             ).scalar_one_or_none()
 
         if not kb:
-            self.bot.send_message(chat_id, f"⚠️ 未找到知识库「{kb_name}」。")
+            self.bot.reply_message(message_id, f"⚠️ 未找到知识库「{kb_name}」。")
             return
 
         # Find code repos bound to this KB
@@ -571,19 +571,19 @@ class CommandRouter:
             ).scalars().all()
 
             if not repos:
-                self.bot.send_message(chat_id, f"⚠️ 知识库「{kb_name}」没有关联的代码库。")
+                self.bot.reply_message(message_id, f"⚠️ 知识库「{kb_name}」没有关联的代码库。")
                 return
 
             repo_ids = [r.id for r in repos]
 
-        self.bot.send_message(chat_id, f"🔄 正在恢复构建知识库「{kb_name}」...")
+        self.bot.reply_message(message_id, f"🔄 正在恢复构建知识库「{kb_name}」...")
 
         for rid in repo_ids:
             self._async_repo_analysis(rid, chat_id)
 
-    def _query_kb_status(self, chat_id: str, sender_id: str) -> None:
+    def _query_kb_status(self, chat_id: str, message_id: str, sender_id: str) -> None:
         if not self._is_admin(sender_id):
-            self.bot.send_message(chat_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
+            self.bot.reply_message(message_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
             return
 
         with get_session() as session:
@@ -592,7 +592,7 @@ class CommandRouter:
             ).scalars().all()
 
             if not kbs:
-                self.bot.send_message(chat_id, "ℹ️ 当前没有任何知识库。")
+                self.bot.reply_message(message_id, "ℹ️ 当前没有任何知识库。")
                 return
 
             lines = [f"📚 知识库列表（共 {len(kbs)} 个）\n"]
@@ -665,11 +665,11 @@ class CommandRouter:
                     f"   绑定群：{binding_count} | 知识条目：{entry_count:,} | 最近归纳：{last_time}"
                 )
 
-            self.bot.send_card(chat_id, "知识库状态", "\n\n".join(lines))
+            self.bot.send_card(chat_id, "知识库状态", "\n\n".join(lines), message_id)
 
-    def _set_debug(self, chat_id: str, sender_id: str, enabled: bool) -> None:
+    def _set_debug(self, chat_id: str, message_id: str, sender_id: str, enabled: bool) -> None:
         if not self._is_admin(sender_id):
-            self.bot.send_message(chat_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
+            self.bot.reply_message(message_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
             return
 
         with get_session() as session:
@@ -683,14 +683,14 @@ class CommandRouter:
                 session.add(ChatSettings(chat_id=chat_id, debug_mode=enabled))
 
         status = "已开启" if enabled else "已关闭"
-        self.bot.send_message(chat_id, f"✅ 本群 Debug 模式{status}。")
+        self.bot.reply_message(message_id, f"✅ 本群 Debug 模式{status}。")
 
-    def _add_admin(self, chat_id: str, sender_id: str, user_id: str) -> None:
+    def _add_admin(self, chat_id: str, message_id: str, sender_id: str, user_id: str) -> None:
         if not self._is_admin(sender_id):
-            self.bot.send_message(chat_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
+            self.bot.reply_message(message_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
             return
         if not user_id:
-            self.bot.send_message(chat_id, "⚠️ 请提供用户 ID，格式：添加管理员 {用户ID} / add-admin {user_id}")
+            self.bot.reply_message(message_id, "⚠️ 请提供用户 ID，格式：添加管理员 {用户ID} / add-admin {user_id}")
             return
 
         with get_session() as session:
@@ -698,21 +698,21 @@ class CommandRouter:
                 select(AdminUser).where(AdminUser.sender_id == user_id)
             ).scalar_one_or_none()
             if existing:
-                self.bot.send_message(chat_id, f"ℹ️ 用户 `{user_id}` 已经是管理员。")
+                self.bot.reply_message(message_id, f"ℹ️ 用户 `{user_id}` 已经是管理员。")
                 return
             session.add(AdminUser(sender_id=user_id))
 
-        self.bot.send_message(chat_id, f"✅ 已将用户 `{user_id}` 添加为管理员。")
+        self.bot.reply_message(message_id, f"✅ 已将用户 `{user_id}` 添加为管理员。")
 
-    def _remove_admin(self, chat_id: str, sender_id: str, user_id: str) -> None:
+    def _remove_admin(self, chat_id: str, message_id: str, sender_id: str, user_id: str) -> None:
         if not self._is_admin(sender_id):
-            self.bot.send_message(chat_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
+            self.bot.reply_message(message_id, "⚠️ 你没有执行此命令的权限，请联系管理员。")
             return
         if not user_id:
-            self.bot.send_message(chat_id, "⚠️ 请提供用户 ID，格式：移除管理员 {用户ID} / remove-admin {user_id}")
+            self.bot.reply_message(message_id, "⚠️ 请提供用户 ID，格式：移除管理员 {用户ID} / remove-admin {user_id}")
             return
         if user_id == sender_id:
-            self.bot.send_message(chat_id, "⚠️ 不能移除自己的管理员权限。")
+            self.bot.reply_message(message_id, "⚠️ 不能移除自己的管理员权限。")
             return
 
         with get_session() as session:
@@ -720,17 +720,17 @@ class CommandRouter:
                 select(AdminUser).where(AdminUser.sender_id == user_id)
             ).scalar_one_or_none()
             if not admin:
-                self.bot.send_message(chat_id, f"ℹ️ 用户 `{user_id}` 不是管理员。")
+                self.bot.reply_message(message_id, f"ℹ️ 用户 `{user_id}` 不是管理员。")
                 return
             session.delete(admin)
 
-        self.bot.send_message(chat_id, f"✅ 已移除用户 `{user_id}` 的管理员权限。")
+        self.bot.reply_message(message_id, f"✅ 已移除用户 `{user_id}` 的管理员权限。")
 
-    def _clear_context(self, chat_id: str) -> None:
+    def _clear_context(self, chat_id: str, message_id: str) -> None:
         rag_service.clear_context(chat_id)
-        self.bot.send_message(chat_id, "✅ 已清空对话上下文，下次提问将不携带历史记录。")
+        self.bot.reply_message(message_id, "✅ 已清空对话上下文，下次提问将不携带历史记录。")
 
-    def _show_help(self, chat_id: str) -> None:
+    def _show_help(self, chat_id: str, message_id: str) -> None:
         help_text = """📖 **可用命令：**
 
 **绑定知识库 / bind-kb** {名称}　— 将本群聊天记录纳入指定知识库
@@ -754,14 +754,16 @@ class CommandRouter:
 **disable-debug**　— 关闭本群 Debug 模式
 
 💬 直接提问即可查询知识库"""
-        self.bot.send_card(chat_id, "帮助", help_text)
+        self.bot.send_card(chat_id, "帮助", help_text, message_id)
 
-    def _rag_query(self, chat_id: str, sender_id: str, question: str) -> None:
+    def _rag_query(self, chat_id: str, message_id: str, sender_id: str, question: str) -> None:
         if not question:
             return
-        self.bot.send_message(chat_id, "🔍 正在检索知识库...")
+        # 使用表情回复替代文本消息
+        if message_id:
+            self.bot.add_reaction(message_id, "Get")
         answer = rag_service.answer(chat_id, question, sender_id=sender_id)
-        self.bot.send_rag_answer_card(chat_id, question, answer)
+        self.bot.send_rag_answer_card(chat_id, question, answer, message_id)
 
     # ------------------------------------------------------------------
     # Helpers
