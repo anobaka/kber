@@ -60,6 +60,10 @@ class MilvusService:
             FieldSchema(name="kb_id", dtype=DataType.INT64),
             FieldSchema(name="last_updated_at", dtype=DataType.INT64),
             FieldSchema(name="last_referenced_at", dtype=DataType.INT64),
+            # 代码贡献者信息（允许为空）
+            FieldSchema(name="commit_author", dtype=DataType.VARCHAR, max_length=100, nullable=True),
+            FieldSchema(name="commit_date", dtype=DataType.VARCHAR, max_length=30, nullable=True),
+            FieldSchema(name="contributors", dtype=DataType.VARCHAR, max_length=2000, nullable=True),
         ]
         schema = CollectionSchema(fields=fields, enable_dynamic_field=True)
         col = Collection(name=name, schema=schema)
@@ -133,6 +137,9 @@ class MilvusService:
         "source": 50,
         "source_detail": 500,
         "certainty": 20,
+        "commit_author": 100,
+        "commit_date": 30,
+        "contributors": 2000,
     }
 
     def insert_knowledge_dicts(
@@ -175,6 +182,7 @@ class MilvusService:
         output_fields = [
             "topic", "content", "source", "source_detail",
             "certainty", "kb_id", "last_updated_at", "last_referenced_at",
+            "commit_author", "commit_date", "contributors",
         ]
 
         results = col.search(

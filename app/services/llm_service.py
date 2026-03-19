@@ -131,8 +131,39 @@ class LLMService:
             {"role": "user", "content": prompt},
         ])
 
-    def generate_code_knowledge(self, repo_map: str, file_path: str, block_type: str, block_name: str, language: str, code: str) -> str:
+    def generate_code_knowledge(self, repo_map: str, file_path: str, block_type: str, block_name: str, language: str, code: str,
+        commit_author: str | None = None,
+        commit_date: str | None = None,
+        contributors: str | None = None,
+    ) -> str:
         """Generate knowledge description for a code block."""
+        # 构建贡献者信息部分
+        contributors_section = ""
+        if contributors:
+            try:
+                import json
+                contrib_list = json.loads(contributors)
+                if contrib_list:
+                    contributors_section = "\n## 贡献者信息\n"
+                    for i, c in enumerate(contrib_list[:3], 1):  # 只显示前3名
+                        contributors_section += f"{i}. {c.get('author', '未知')}：{c.get('commits', 0)} 次提交\n"
+                    if len(contrib_list) > 3:
+                        contributors_section += f"   ... 及其他 {len(contrib_list) - 3} 位贡献者\n"
+            except Exception:
+                pass
+
+        # 最后修改信息
+        last_modified_section = ""
+        if commit_author and commit_date:
+            last_modified_section = f"\n最后修改：{commit_author} @ {commit_date[:10] if len(commit_date) > 10 else commit_date}\n"
+
+        # 构建开发者信息段落（内容部分，不包含标题）
+        dev_info_section = ""
+        if last_modified_section:
+            dev_info_section += last_modified_section
+        if contributors_section:
+            dev_info_section += contributors_section
+
         prompt = f"""你是一个代码文档专家。请为以下代码生成一段结构化的知识描述。
 
 ## 项目概览
@@ -142,6 +173,9 @@ class LLMService:
 文件：{file_path}
 类型：{block_type}
 名称：{block_name}
+
+## 开发者信息
+{dev_info_section if dev_info_section else "暂无开发者信息记录。"}
 
 ```{language}
 {code}
@@ -154,6 +188,7 @@ class LLMService:
 3. 【输入输出】：参数和返回值说明
 4. 【依赖关系】：调用了哪些其他模块/方法
 5. 【关键词】：便于检索的关键词（3-5个，逗号分隔）
+6. 【维护信息】：基于上述开发者信息，简要说明该代码的维护者情况和维护活跃度
 
 注意：描述要面向"检索场景"优化，让开发者通过自然语言提问时能找到这段代码。
 """

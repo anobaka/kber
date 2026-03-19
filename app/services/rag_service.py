@@ -155,6 +155,37 @@ class RAGService:
     def _build_context(self, hits: list[dict[str, Any]]) -> str:
         """Build RAG context from search hits."""
         parts: list[str] = []
+
+        # 统计开发人员信息（用于回答"主要开发人员"类问题）
+        author_stats: dict[str, dict] = {}
+        for hit in hits:
+            if hit.get("commit_author"):
+                author = hit["commit_author"]
+                if author not in author_stats:
+                    author_stats[author] = {"count": 0, "files": set()}
+                author_stats[author]["count"] += 1
+                if hit.get("file_path"):
+                    author_stats[author]["files"].add(hit["file_path"])
+
+        # 如果有多个代码块，添加开发人员统计
+        if len(hits) > 1 and author_stats:
+            # 按涉及代码块数量和文件数量排序
+            sorted_authors = sorted(
+                author_stats.items(),
+                key=lambda x: (x[1]["count"], len(x[1]["files"])),
+                reverse=True
+            )
+            dev_summary = "### 项目开发人员统计\n"
+            dev_summary += f"共检索到 {len(hits)} 个代码块，涉及 {len(author_stats)} 位开发人员：\n\n"
+            for i, (author, stats) in enumerate(sorted_authors[:5], 1):
+                file_count = len(stats["files"])
+                block_count = stats["count"]
+                dev_summary += f"{i}. **{author}**：参与 {file_count} 个文件，{block_count} 个代码块\n"
+            if len(sorted_authors) > 5:
+                dev_summary += f"\n... 及其他 {len(sorted_authors) - 5} 位开发人员\n"
+            dev_summary += "\n---\n"
+            parts.append(dev_summary)
+
         for i, hit in enumerate(hits, 1):
             certainty_note = ""
             if hit.get("certainty") == "disputed":
@@ -162,9 +193,30 @@ class RAGService:
             elif hit.get("certainty") == "unverified":
                 certainty_note = "ℹ️ 此信息待确认"
 
+            # 构建开发者信息（独立段落）
+            dev_info = ""
+            if hit.get("commit_author"):
+                dev_info += f"\n**最后修改**：{hit['commit_author']}"
+                if hit.get("commit_date"):
+                    dev_info += f" @ {hit['commit_date'][:10] if len(hit['commit_date']) > 10 else hit['commit_date']}"
+
+            # 添加贡献者信息
+            if hit.get("contributors"):
+                try:
+                    import json
+                    contributors = json.loads(hit["contributors"])
+                    if contributors:
+                        dev_info += "\n**贡献者**："
+                        for j, c in enumerate(contributors[:2], 1):
+                            dev_info += f"\n  - {c.get('author', '未知')}：{c.get('commits', 0)} 次提交"
+                        if len(contributors) > 2:
+                            dev_info += f"\n  - ... 及其他 {len(contributors) - 2} 位"
+                except Exception:
+                    pass
+
             part = f"""### 参考资料 {i}
 {hit.get('content', '')}
-来源：{hit.get('source_detail', hit.get('source', 'unknown'))}
+来源：{hit.get('source_detail', hit.get('source', 'unknown'))}{dev_info}
 {certainty_note}"""
             parts.append(part)
 

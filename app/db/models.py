@@ -158,6 +158,15 @@ class CodeBlock(Base):
         String(64), comment="SHA-256 of code content, used to detect changes",
     )
     commit_hash: Mapped[Optional[str]] = mapped_column(String(64))
+    commit_author: Mapped[Optional[str]] = mapped_column(
+        String(100), comment="最后修改该代码块的作者"
+    )
+    commit_date: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, comment="最后修改该代码块的时间"
+    )
+    contributors: Mapped[Optional[str]] = mapped_column(
+        Text, comment='JSON格式: [{"author": "张三", "commits": 10, "last_date": "2024-01-15"}, ...]'
+    )
     description: Mapped[Optional[str]] = mapped_column(
         Text, comment="LLM-generated knowledge text, persisted before Milvus write",
     )

@@ -18,6 +18,7 @@ Architecture:
 """
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -170,11 +171,7 @@ class RepoAnalyzer:
     #  Public entry point                                                  #
     # ------------------------------------------------------------------ #
 
-    def analyze_repo(
-        self,
-        repo_id: int,
-        notify_chat_ids: list[str] | None = None,
-    ) -> dict[str, int]:
+    def analyze_repo(self, repo_id: int, notify_chat_ids: list[str] | None = None) -> dict[str, int]:
         """Full analysis of a code repository.
 
         Returns stats dict ``{files_parsed, blocks_found, blocks_success,
@@ -243,7 +240,7 @@ class RepoAnalyzer:
             # Step 1: Git clone / pull
             # ----------------------------------------------------------
             _check()
-            _notify("📦 正在同步代码仓库...", progress=True)
+            _notify("📦 正在同步代码仓库", progress=True)
 
             is_new = not os.path.exists(os.path.join(repo_dir, ".git"))
             if is_new:
@@ -265,7 +262,7 @@ class RepoAnalyzer:
             # Step 2: Scan & filter files
             # ----------------------------------------------------------
             _check()
-            _notify("🔍 正在扫描代码库...", progress=True)
+            _notify("🔍 正在扫描代码库变更", progress=True)
 
             all_files = self._scan_files(repo_dir)
             if changed_files is not None:
@@ -276,8 +273,13 @@ class RepoAnalyzer:
             else:
                 files_to_process = all_files
 
+            # 批量获取所有文件的贡献者信息（一次 git log 调用，性能优化）
+            _notify("📊 正在获取开发者信息", progress=True)
+            rel_paths = [self._relative_path(fpath, repo_dir) for fpath in files_to_process]
+            all_file_contributors = self._batch_get_file_contributors(repo_dir, rel_paths)
+
             total_files = len(files_to_process)
-            _notify("✅ 扫描完成", progress=True, done=True)
+            _notify("✅ 代码库扫描完成", progress=True, done=True)
 
             # ----------------------------------------------------------
             # Step 3: AST parse → code blocks
@@ -292,7 +294,9 @@ class RepoAnalyzer:
                     eta = parse_throttle.eta(i + 1)
                     eta_part = f"，预计{eta}" if eta else ""
                     _notify(f"🔍 正在解析（{pct}%{eta_part}）...", progress=True)
-                blocks = self._parse_file(fpath, repo_dir, repo_id)
+                # 从批量结果中获取文件的提交信息
+                file_commit = all_file_contributors.get(rel_paths[i], {})
+                blocks = self._parse_file(fpath, repo_dir, repo_id, file_commit)
                 new_blocks.extend(blocks)
                 stats["files_parsed"] += 1
 
@@ -487,6 +491,93 @@ class RepoAnalyzer:
                 changes.append({"status": parts[0][0], "path": parts[-1]})
         return changes
 
+    def _batch_get_file_contributors(self, repo_dir: str, file_paths: list[str]) -> dict[str, dict]:
+        """批量获取多个文件的贡献者统计信息（一次 git log 调用）
+
+        Args:
+            repo_dir: 仓库目录
+            file_paths: 相对文件路径列表
+
+        Returns:
+            {file_path: contributors_dict} 映射
+        """
+        from collections import defaultdict
+
+        if not file_paths:
+            return {}
+
+        # 一次 git log 获取所有提交记录和涉及的文件
+        # --name-only 输出每次提交修改的文件列表
+        result = subprocess.run(
+            [
+                "git", "log",
+                "--format=COMMIT:%H|%an|%ad",
+                "--date=iso-strict",
+                "--name-only",
+            ],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+
+        # 解析输出，构建 file -> commits 映射
+        file_commits: dict[str, list[dict]] = defaultdict(list)
+        current_commit = None
+
+        for line in result.stdout.strip().split("\n"):
+            if not line:
+                continue
+
+            if line.startswith("COMMIT:"):
+                # 解析提交信息
+                parts = line[7:].split("|", 2)
+                if len(parts) == 3:
+                    current_commit = {
+                        "hash": parts[0],
+                        "author": parts[1],
+                        "date": datetime.fromisoformat(parts[2]),
+                    }
+            elif current_commit and line:
+                # 这是文件路径
+                file_commits[line].append(current_commit)
+
+        # 只保留我们关心的文件
+        file_set = set(file_paths)
+        result_map: dict[str, dict] = {}
+
+        for file_path in file_paths:
+            commits = file_commits.get(file_path, [])
+
+            if not commits:
+                result_map[file_path] = {}
+                continue
+
+            # 统计每个作者的提交次数和最后提交时间
+            author_stats = defaultdict(lambda: {"commits": 0, "last_date": None})
+            for commit in commits:
+                author = commit["author"]
+                author_stats[author]["commits"] += 1
+                if author_stats[author]["last_date"] is None or commit["date"] > author_stats[author]["last_date"]:
+                    author_stats[author]["last_date"] = commit["date"]
+
+            # 按提交次数排序
+            sorted_contributors = sorted(
+                [
+                    {"author": author, "commits": stats["commits"], "last_date": stats["last_date"]}
+                    for author, stats in author_stats.items()
+                ],
+                key=lambda x: x["commits"],
+                reverse=True
+            )
+
+            result_map[file_path] = {
+                "last_commit": commits[0],
+                "top_contributor": sorted_contributors[0] if sorted_contributors else None,
+                "all_contributors": sorted_contributors,
+            }
+
+        return result_map
+
     # ================================================================== #
     #  File scanning                                                       #
     # ================================================================== #
@@ -531,7 +622,13 @@ class RepoAnalyzer:
     #  AST parsing                                                         #
     # ================================================================== #
 
-    def _parse_file(self, fpath: str, repo_dir: str, repo_id: int) -> list[dict[str, Any]]:
+    def _parse_file(self, fpath: str, repo_dir: str, repo_id: int, file_commit: dict | None = None) -> list[dict[str, Any]]:
+        """
+        解析文件，提取代码块
+
+        Args:
+            file_commit: 包含 commit_hash, commit_author, commit_date, contributors 的字典
+        """
         ext = os.path.splitext(fpath)[1].lower()
         lang = LANG_MAP.get(ext)
         rel_path = self._relative_path(fpath, repo_dir)
@@ -545,12 +642,12 @@ class RepoAnalyzer:
             logger.debug("Skipping empty file: %s", rel_path)
             return []
         if lang:
-            blocks = self._parse_with_treesitter(source, lang, rel_path, repo_id)
+            blocks = self._parse_with_treesitter(source, lang, rel_path, repo_id, file_commit)
             if blocks:
                 return blocks
-        return self._fallback_parse(source, rel_path, repo_id, ext)
+        return self._fallback_parse(source, rel_path, repo_id, ext, file_commit)
 
-    def _parse_with_treesitter(self, source: str, lang: str, rel_path: str, repo_id: int) -> list[dict[str, Any]]:
+    def _parse_with_treesitter(self, source: str, lang: str, rel_path: str, repo_id: int, file_commit: dict | None = None) -> list[dict[str, Any]]:
         try:
             import tree_sitter
             if lang not in self._ts_parsers:
@@ -561,7 +658,7 @@ class RepoAnalyzer:
             parser = self._ts_parsers[lang]
             tree = parser.parse(source.encode("utf-8"))
             blocks: list[dict[str, Any]] = []
-            self._extract_blocks(tree.root_node, source, rel_path, repo_id, lang, blocks, parent_class=None)
+            self._extract_blocks(tree.root_node, source, rel_path, repo_id, lang, blocks, parent_class=None, file_commit=file_commit)
             return blocks
         except Exception as e:
             logger.debug("Tree-sitter parse failed for %s: %s", rel_path, e)
@@ -592,9 +689,20 @@ class RepoAnalyzer:
             logger.debug("tree-sitter language %s not installed", lang)
             return None
 
-    def _extract_blocks(self, node: Any, source: str, rel_path: str, repo_id: int, lang: str, blocks: list[dict[str, Any]], parent_class: str | None) -> None:
+    def _extract_blocks(self, node: Any, source: str, rel_path: str, repo_id: int, lang: str, blocks: list[dict[str, Any]], parent_class: str | None, file_commit: dict | None = None) -> None:
         class_types = {"class_definition", "class_declaration", "class_specifier", "struct_item", "struct_declaration", "interface_declaration", "type_declaration", "enum_declaration"}
         func_types = {"function_definition", "function_declaration", "method_definition", "method_declaration", "function_item", "arrow_function"}
+
+        # 从 file_commit 提取提交信息
+        commit_info = {}
+        if file_commit:
+            last_commit = file_commit.get("last_commit", {})
+            commit_info = {
+                "commit_hash": last_commit.get("hash"),
+                "commit_author": last_commit.get("author"),
+                "commit_date": last_commit.get("date"),
+                "contributors": json.dumps(file_commit.get("all_contributors", []), default=str) if file_commit.get("all_contributors") else None,
+            }
 
         node_type = node.type
         if node_type in class_types:
@@ -605,9 +713,10 @@ class RepoAnalyzer:
                 "block_name": name, "parent_class": parent_class,
                 "start_line": node.start_point[0] + 1, "end_line": node.end_point[0] + 1,
                 "signature": self._extract_signature(code), "code": code, "repo_id": repo_id,
+                **commit_info,
             })
             for child in node.children:
-                self._extract_blocks(child, source, rel_path, repo_id, lang, blocks, parent_class=name)
+                self._extract_blocks(child, source, rel_path, repo_id, lang, blocks, parent_class=name, file_commit=file_commit)
             return
 
         if node_type in func_types:
@@ -619,11 +728,12 @@ class RepoAnalyzer:
                 "block_name": name, "parent_class": parent_class,
                 "start_line": node.start_point[0] + 1, "end_line": node.end_point[0] + 1,
                 "signature": self._extract_signature(code), "code": code, "repo_id": repo_id,
+                **commit_info,
             })
             return
 
         for child in node.children:
-            self._extract_blocks(child, source, rel_path, repo_id, lang, blocks, parent_class=parent_class)
+            self._extract_blocks(child, source, rel_path, repo_id, lang, blocks, parent_class=parent_class, file_commit=file_commit)
 
     def _get_node_name(self, node: Any) -> str:
         for child in node.children:
@@ -638,7 +748,19 @@ class RepoAnalyzer:
                 return s[:500]
         return ""
 
-    def _fallback_parse(self, source: str, rel_path: str, repo_id: int, ext: str) -> list[dict[str, Any]]:
+    def _fallback_parse(self, source: str, rel_path: str, repo_id: int, ext: str, file_commit: dict | None = None) -> list[dict[str, Any]]:
+        """Fallback parse for files without tree-sitter support."""
+        # 从 file_commit 提取提交信息
+        commit_info = {}
+        if file_commit:
+            last_commit = file_commit.get("last_commit", {})
+            commit_info = {
+                "commit_hash": last_commit.get("hash"),
+                "commit_author": last_commit.get("author"),
+                "commit_date": last_commit.get("date"),
+                "contributors": json.dumps(file_commit.get("all_contributors", []), default=str) if file_commit.get("all_contributors") else None,
+            }
+
         lang = LANG_MAP.get(ext, ext.lstrip("."))
         lines = source.split("\n")
         if len(lines) <= 100:
@@ -647,6 +769,7 @@ class RepoAnalyzer:
                 "block_name": os.path.basename(rel_path), "parent_class": None,
                 "start_line": 1, "end_line": len(lines), "signature": "",
                 "code": source, "repo_id": repo_id,
+                **commit_info,
             }]
         blocks: list[dict[str, Any]] = []
         chunk_size = 80
@@ -657,6 +780,7 @@ class RepoAnalyzer:
                 "block_name": f"{os.path.basename(rel_path)}:{i + 1}", "parent_class": None,
                 "start_line": i + 1, "end_line": min(i + chunk_size, len(lines)),
                 "signature": "", "code": chunk, "repo_id": repo_id,
+                **commit_info,
             })
         return blocks
 
@@ -664,13 +788,7 @@ class RepoAnalyzer:
     #  Block-level tracking (code_block table)                             #
     # ================================================================== #
 
-    def _sync_code_blocks(
-        self,
-        repo_id: int,
-        new_blocks: list[dict[str, Any]],
-        commit_hash: str,
-        changed_files: list[dict[str, str]] | None,
-    ) -> list[dict[str, Any]]:
+    def _sync_code_blocks(self, repo_id: int, new_blocks: list[dict[str, Any]], commit_hash: str, changed_files: list[dict[str, str]] | None) -> list[dict[str, Any]]:
         """Sync parsed blocks with ``code_block`` table.
 
         For each parsed block, compute a ``content_hash``.  If a matching
@@ -716,7 +834,10 @@ class RepoAnalyzer:
                 if existing:
                     # Code changed or previous attempt failed → reset to pending
                     existing.content_hash = chash
-                    existing.commit_hash = commit_hash
+                    existing.commit_hash = block.get("commit_hash") or commit_hash
+                    existing.commit_author = block.get("commit_author")
+                    existing.commit_date = block.get("commit_date")
+                    existing.contributors = block.get("contributors")
                     existing.start_line = block.get("start_line")
                     existing.end_line = block.get("end_line")
                     existing.signature = block.get("signature")
@@ -735,7 +856,10 @@ class RepoAnalyzer:
                         end_line=block.get("end_line"),
                         signature=block.get("signature"),
                         content_hash=chash,
-                        commit_hash=commit_hash,
+                        commit_hash=block.get("commit_hash") or commit_hash,
+                        commit_author=block.get("commit_author"),
+                        commit_date=block.get("commit_date"),
+                        contributors=block.get("contributors"),
                         status="pending",
                     )
                     session.add(cb)
@@ -746,9 +870,7 @@ class RepoAnalyzer:
 
         return blocks_needing_llm
 
-    def _load_failed_blocks(
-        self, repo_id: int, exclude_ids: set[int] | None = None,
-    ) -> list[dict[str, Any]]:
+    def _load_failed_blocks(self, repo_id: int, exclude_ids: set[int] | None = None) -> list[dict[str, Any]]:
         """Load previously failed or orphaned pending blocks for retry.
 
         Blocks with ``status='failed'`` are always loaded (up to MAX_BLOCK_RETRY).
@@ -789,6 +911,9 @@ class RepoAnalyzer:
                     "_cb_id": row.id,
                     "_is_retry": True,
                     "_retry_count": row.retry_count,
+                    "commit_author": row.commit_author,
+                    "commit_date": row.commit_date,
+                    "contributors": row.contributors,
                 })
 
             if skipped:
@@ -824,9 +949,7 @@ class RepoAnalyzer:
                 )
             )
 
-    def _load_generated_blocks(
-        self, repo_id: int, commit_hash: str,
-    ) -> list[dict[str, Any]]:
+    def _load_generated_blocks(self, repo_id: int, commit_hash: str) -> list[dict[str, Any]]:
         """Load blocks with ``status='generated'`` — LLM description cached in DB.
 
         These blocks had their LLM generation completed in a previous run but
@@ -859,6 +982,9 @@ class RepoAnalyzer:
                             os.path.splitext(row.file_path)[1].lower(), "",
                         ),
                         "_cb_id": row.id,
+                        "commit_author": row.commit_author,
+                        "commit_date": row.commit_date,
+                        "contributors": row.contributors,
                     },
                     "description": row.description,
                     "commit_hash": commit_hash,
@@ -961,7 +1087,7 @@ class RepoAnalyzer:
 
     def _generate_repo_map(self, repo_dir: str, files: list[str]) -> str:
         tree: dict[str, list[str]] = {}
-        for fpath in files[:200]:
+        for fpath in files[:500]:
             rel = self._relative_path(fpath, repo_dir)
             parts = rel.split(os.sep)
             dir_path = "/".join(parts[:-1]) or "."
@@ -976,16 +1102,7 @@ class RepoAnalyzer:
                 lines.append(f"    ... 还有 {len(tree[dir_path]) - 20} 个文件")
         return "\n".join(lines[:100])
 
-    def _generate_block_knowledge(
-        self,
-        blocks: list[dict[str, Any]],
-        repo_map: str,
-        kb_id: int,
-        repo_id: int,
-        commit_hash: str,
-        notify_fn: Any = None,
-        check_cancelled_fn: Any = None,
-    ) -> tuple[list[dict[str, Any]], int]:
+    def _generate_block_knowledge(self, blocks: list[dict[str, Any]], repo_map: str, kb_id: int, repo_id: int, commit_hash: str, notify_fn: Any = None, check_cancelled_fn: Any = None) -> tuple[list[dict[str, Any]], int]:
         """Generate knowledge for blocks via LLM.
 
         Returns ``(success_entries, failed_count)``.
@@ -1036,6 +1153,8 @@ class RepoAnalyzer:
                             )
                     return None
 
+                # 格式化 commit_date 为字符串
+                commit_date_str = str(block["commit_date"] or "unknown")
                 description = llm_service.generate_code_knowledge(
                     repo_map=repo_map,
                     file_path=block["file_path"],
@@ -1043,6 +1162,9 @@ class RepoAnalyzer:
                     block_name=block.get("block_name") or "unknown",
                     language=block.get("language", ""),
                     code=code[:8000],
+                    commit_author=block.get("commit_author"),
+                    commit_date=commit_date_str,
+                    contributors=block.get("contributors"),
                 )
 
                 # Persist description to DB immediately so it survives
@@ -1094,12 +1216,7 @@ class RepoAnalyzer:
 
         return entries, failed
 
-    def _store_block_knowledge(
-        self,
-        kb_id: int,
-        entries: list[dict[str, Any]],
-        notify_fn: Any = None,
-    ) -> None:
+    def _store_block_knowledge(self, kb_id: int, entries: list[dict[str, Any]], notify_fn: Any = None) -> None:
         """Embed and store block-level knowledge in Milvus.
 
         Before inserting, delete old Milvus entries for the same blocks
@@ -1180,6 +1297,9 @@ class RepoAnalyzer:
                 "block_type": block["block_type"],
                 "block_name": block.get("block_name") or "",
                 "commit_hash": entry["commit_hash"],
+                "commit_author": block.get("commit_author"),
+                "commit_date": block.get("commit_date").isoformat() if block.get("commit_date") else None,
+                "contributors": block.get("contributors"),
             })
 
         milvus_service.insert_knowledge_dicts(kb_id, milvus_entries)
@@ -1201,12 +1321,7 @@ class RepoAnalyzer:
     #  Module-level summaries                                              #
     # ================================================================== #
 
-    def _get_affected_modules(
-        self,
-        repo_id: int,
-        blocks_processed: list[dict[str, Any]],
-        changed_files: list[dict[str, str]] | None,
-    ) -> set[str]:
+    def _get_affected_modules(self, repo_id: int, blocks_processed: list[dict[str, Any]], changed_files: list[dict[str, str]] | None) -> set[str]:
         """Determine which module directories need summary regeneration."""
         affected: set[str] = set()
 
@@ -1222,15 +1337,7 @@ class RepoAnalyzer:
 
         return affected
 
-    def _regenerate_module_summaries(
-        self,
-        kb_id: int,
-        repo_id: int,
-        affected_dirs: set[str],
-        repo_map: str,
-        notify_fn: Any = None,
-        check_cancelled_fn: Any = None,
-    ) -> int:
+    def _regenerate_module_summaries(self, kb_id: int, repo_id: int, affected_dirs: set[str], repo_map: str, notify_fn: Any = None, check_cancelled_fn: Any = None) -> int:
         """Regenerate module summaries for affected directories (concurrent).
 
         Returns count of successfully updated modules.
@@ -1323,9 +1430,7 @@ class RepoAnalyzer:
 
         return updated
 
-    def _collect_block_descriptions(
-        self, kb_id: int, module_dir: str, blocks: list[Any],
-    ) -> str:
+    def _collect_block_descriptions(self, kb_id: int, module_dir: str, blocks: list[Any]) -> str:
         """Collect existing block-level descriptions from Milvus for a module."""
         parts: list[str] = []
         for block in blocks[:50]:  # Limit to avoid huge prompts
