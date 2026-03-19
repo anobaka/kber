@@ -279,6 +279,7 @@ class RepoAnalyzer:
             all_file_contributors = self._batch_get_file_contributors(repo_dir, rel_paths)
 
             total_files = len(files_to_process)
+            logger.info("Total files to process: %d", total_files)
             _notify("✅ 代码库扫描完成", progress=True, done=True)
 
             # ----------------------------------------------------------
@@ -302,6 +303,7 @@ class RepoAnalyzer:
 
             if total_files:
                 _notify("✅ 解析完成", progress=True, done=True)
+                logger.info("Total blocks parsed: %d", len(new_blocks))
 
             # ----------------------------------------------------------
             # Step 4: Upsert code_block records, detect what needs LLM
@@ -346,6 +348,7 @@ class RepoAnalyzer:
             # ----------------------------------------------------------
             _check()
             repo_map = self._generate_repo_map(repo_dir, all_files)
+            logger.info("repo_map: %s", repo_map)
 
             # Load blocks that already have LLM descriptions from a previous
             # interrupted run (status='generated') — skip LLM, go straight
@@ -747,6 +750,35 @@ class RepoAnalyzer:
             if s and not s.startswith("#") and not s.startswith("//"):
                 return s[:500]
         return ""
+
+    def _format_developer_info(self, commit_author: str | None, commit_date: str | None, contributors: str | None) -> str | None:
+        """格式化开发者信息段落"""
+        if not commit_author and not contributors:
+            return None
+        
+        dev_info_parts = []
+        
+        # 最后修改信息
+        if commit_author and commit_date:
+            date_part = commit_date[:10] if len(commit_date) > 10 else commit_date
+            dev_info_parts.append(f"\n最后修改：{commit_author} @ {date_part}\n")
+        
+        # 贡献者信息
+        if contributors:
+            try:
+                import json
+                contrib_list = json.loads(contributors)
+                if contrib_list:
+                    contributors_section = "\n## 贡献者信息\n"
+                    for i, c in enumerate(contrib_list[:3], 1):  # 只显示前3名
+                        contributors_section += f"{i}. {c.get('author', '未知')}：{c.get('commits', 0)} 次提交\n"
+                    if len(contrib_list) > 3:
+                        contributors_section += f"   ... 及其他 {len(contrib_list) - 3} 位贡献者\n"
+                    dev_info_parts.append(contributors_section)
+            except Exception:
+                pass
+        
+        return "".join(dev_info_parts) if dev_info_parts else None
 
     def _fallback_parse(self, source: str, rel_path: str, repo_id: int, ext: str, file_commit: dict | None = None) -> list[dict[str, Any]]:
         """Fallback parse for files without tree-sitter support."""
@@ -1153,8 +1185,9 @@ class RepoAnalyzer:
                             )
                     return None
 
-                # 格式化 commit_date 为字符串
+                # 构建开发者信息段落
                 commit_date_str = str(block["commit_date"] or "unknown")
+                developer_info = self._format_developer_info(block.get("commit_author"), commit_date_str, block.get("contributors"))
                 description = llm_service.generate_code_knowledge(
                     repo_map=repo_map,
                     file_path=block["file_path"],
@@ -1162,9 +1195,7 @@ class RepoAnalyzer:
                     block_name=block.get("block_name") or "unknown",
                     language=block.get("language", ""),
                     code=code[:8000],
-                    commit_author=block.get("commit_author"),
-                    commit_date=commit_date_str,
-                    contributors=block.get("contributors"),
+                    developer_info=developer_info,
                 )
 
                 # Persist description to DB immediately so it survives
@@ -1373,6 +1404,7 @@ class RepoAnalyzer:
                     module_path=module_dir,
                     block_summaries=block_summaries,
                 )
+                logger.info("generate_module_summary summary: %s", summary)
 
                 try:
                     milvus_service.delete_by_expr(
@@ -1486,6 +1518,7 @@ class RepoAnalyzer:
                 repo_map=repo_map,
                 module_summaries=module_summaries,
             )
+            logger.info("generate_repo_overview overview: %s", overview)
 
             # Delete old overview, insert new
             try:
