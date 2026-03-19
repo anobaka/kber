@@ -94,6 +94,7 @@ class CommandRouter:
     _EXACT_COMMANDS: list[tuple[set[str], str]] = [
         ({"立即总结", "summarize"}, "_force_summarize"),
         ({"查询知识库", "list-kb"}, "_query_kb_status"),
+        ({"查询本群知识库", "list-chat-kb"}, "_query_chat_kb"),
     ]
 
     def handle(self, chat_id: str, message_id: str, sender_id: str, text: str, *, user_id: str = "") -> None:
@@ -595,9 +596,15 @@ class CommandRouter:
                 self.bot.reply_message(message_id, "ℹ️ 当前没有任何知识库。")
                 return
 
-            lines = [f"📚 知识库列表（共 {len(kbs)} 个）\n"]
+            # 创建 Markdown 表格
+            table_header = [
+                "## 📚 知识库列表（共 {} 个）\n".format(len(kbs)),
+                "| 名称 | 类型 | 代码库 | 绑定群 | 知识条目 | 最近归纳 |",
+                "|------|------|--------|--------|----------|----------|"
+            ]
+            table_rows = []
 
-            for i, kb in enumerate(kbs, 1):
+            for kb in kbs:
                 # Count bindings – code KBs use ChatRepoBinding, others use ChatKbBinding
                 if kb.kb_type == "code":
                     code_repo = session.execute(
@@ -616,6 +623,7 @@ class CommandRouter:
                     else:
                         binding_count = 0
                 else:
+                    code_repo = None
                     binding_count = session.execute(
                         select(func.count()).select_from(ChatKbBinding).where(
                             ChatKbBinding.kb_id == kb.id,
@@ -647,8 +655,8 @@ class CommandRouter:
                     else:
                         last_time = f"{int(delta.days)} 天前"
 
-                # Code repo info (code_repo already queried above for code KBs)
-                code_info = ""
+                # Code repo info
+                code_url = "-"
                 if kb.kb_type == "code":
                     if not code_repo:
                         code_repo = session.execute(
@@ -658,14 +666,116 @@ class CommandRouter:
                             )
                         ).scalar_one_or_none()
                     if code_repo:
-                        code_info = f"\n   代码库：{code_repo.git_url}"
+                        code_url = f"`{code_repo.git_url}`"
 
-                lines.append(
-                    f"{i}. {kb.name}（类型：{kb.kb_type}）{code_info}\n"
-                    f"   绑定群：{binding_count} | 知识条目：{entry_count:,} | 最近归纳：{last_time}"
+                # 表格行
+                table_rows.append(
+                    f"| {kb.name} | {kb.kb_type} | {code_url} | {binding_count} | {entry_count:,} | {last_time} |"
                 )
 
-            self.bot.send_card(chat_id, "知识库状态", "\n\n".join(lines), message_id)
+            content = "\n".join(table_header + table_rows)
+            self.bot.send_card(chat_id, "知识库状态", content, message_id)
+
+    def _query_chat_kb(self, chat_id: str, message_id: str, sender_id: str) -> None:
+        """查询本群绑定的知识库"""
+        with get_session() as session:
+            # 获取本群绑定的非代码知识库
+            chat_kbs = session.execute(
+                select(KnowledgeBase).join(
+                    ChatKbBinding, ChatKbBinding.kb_id == KnowledgeBase.id,
+                ).where(
+                    ChatKbBinding.chat_id == chat_id,
+                    ChatKbBinding.deleted_at.is_(None),
+                    KnowledgeBase.deleted_at.is_(None),
+                )
+            ).scalars().all()
+
+            # 获取本群绑定的代码仓库
+            code_repos = session.execute(
+                select(CodeRepo).join(
+                    ChatRepoBinding, ChatRepoBinding.repo_id == CodeRepo.id,
+                ).where(
+                    ChatRepoBinding.chat_id == chat_id,
+                    ChatRepoBinding.deleted_at.is_(None),
+                    CodeRepo.deleted_at.is_(None),
+                )
+            ).scalars().all()
+
+            if not chat_kbs and not code_repos:
+                self.bot.reply_message(message_id, "ℹ️ 本群尚未绑定任何知识库。")
+                return
+
+            # 创建 Markdown 表格
+            table_header = [
+                "## 📚 本群知识库\n",
+                "| 名称 | 类型 | 知识条目 | 最近归纳 |",
+                "|------|------|----------|----------|"
+            ]
+            table_rows = []
+
+            # 处理非代码知识库
+            for kb in chat_kbs:
+                try:
+                    entry_count = milvus_service.get_collection_count(kb.id)
+                except Exception:
+                    entry_count = 0
+
+                last_log = session.execute(
+                    select(SummarizeTaskLog).where(
+                        SummarizeTaskLog.kb_id == kb.id,
+                        SummarizeTaskLog.status == "success",
+                    ).order_by(SummarizeTaskLog.finished_at.desc()).limit(1)
+                ).scalar_one_or_none()
+
+                last_time = "从未"
+                if last_log and last_log.finished_at:
+                    delta = datetime.utcnow() - last_log.finished_at
+                    if delta.total_seconds() < 3600:
+                        last_time = f"{int(delta.total_seconds() / 60)} 分钟前"
+                    elif delta.total_seconds() < 86400:
+                        last_time = f"{int(delta.total_seconds() / 3600)} 小时前"
+                    else:
+                        last_time = f"{int(delta.days)} 天前"
+
+                table_rows.append(
+                    f"| {kb.name} | {kb.kb_type} | {entry_count:,} | {last_time} |"
+                )
+
+            # 处理代码仓库
+            for repo in code_repos:
+                kb_id = repo.kb_id
+                if kb_id:
+                    try:
+                        entry_count = milvus_service.get_collection_count(kb_id)
+                    except Exception:
+                        entry_count = 0
+
+                    last_log = session.execute(
+                        select(SummarizeTaskLog).where(
+                            SummarizeTaskLog.kb_id == kb_id,
+                            SummarizeTaskLog.status == "success",
+                        ).order_by(SummarizeTaskLog.finished_at.desc()).limit(1)
+                    ).scalar_one_or_none()
+
+                    last_time = "从未"
+                    if last_log and last_log.finished_at:
+                        delta = datetime.utcnow() - last_log.finished_at
+                        if delta.total_seconds() < 3600:
+                            last_time = f"{int(delta.total_seconds() / 60)} 分钟前"
+                        elif delta.total_seconds() < 86400:
+                            last_time = f"{int(delta.total_seconds() / 3600)} 小时前"
+                        else:
+                            last_time = f"{int(delta.days)} 天前"
+                else:
+                    entry_count = 0
+                    last_time = "-"
+
+                table_rows.append(
+                    f"| {repo.git_url} | code | {entry_count:,} | {last_time} |"
+                )
+
+            content = "\n".join(table_header + table_rows)
+            self.bot.send_card(chat_id, "本群知识库", content, message_id)
 
     def _set_debug(self, chat_id: str, message_id: str, sender_id: str, enabled: bool) -> None:
         if not self._is_admin(sender_id):
@@ -739,6 +849,7 @@ class CommandRouter:
 **解绑代码库 / unbind-repo** {org/repo 或 URL}　— 解除代码库关联
 **添加知识 / add-knowledge** [知识库名称] {内容}　— 手动添加知识
 **清空上下文 / clear-context**　— 清空对话上下文，下次提问不携带历史记录
+**查询本群知识库 / list-chat-kb**　— 查看本群已绑定的知识库
 **我的ID / myid**　— 获取你的用户 ID
 **帮助 / help**　— 显示本帮助信息
 

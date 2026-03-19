@@ -163,7 +163,7 @@ class FeishuBot:
             message_id = msg.message_id
 
             if self._is_duplicate(message_id):
-                logger.debug("Duplicate message ignored: %s", message_id)
+                logger.info("Duplicate message ignored: %s", message_id)
                 return
 
             # Log full sender structure for debugging
