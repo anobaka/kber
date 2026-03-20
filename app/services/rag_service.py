@@ -12,6 +12,7 @@ from app.db.session import get_session
 from app.services.embedding_service import embedding_service
 from app.services.llm_service import llm_service
 from app.services.milvus_service import milvus_service
+from app.services.rerank_service import rerank_service
 from app.services.security_service import check_input, sanitize_output
 
 logger = logging.getLogger(__name__)
@@ -68,14 +69,41 @@ class RAGService:
         if not all_hits:
             return "抱歉，知识库中暂未找到与您问题相关的信息。请尝试换个方式提问，或联系管理员添加相关知识。"
 
-        # Sort by score (cosine similarity, higher is better) and apply certainty weighting
-        for hit in all_hits:
+        # 保存原始排序结果（用于对比）
+        original_hits = all_hits.copy()
+        for hit in original_hits:
             base_score = hit.get("score", 0)
             certainty = hit.get("certainty", "unverified")
             weight = {"confirmed": 1.0, "disputed": 0.8, "unverified": 0.6}.get(certainty, 0.6)
             hit["weighted_score"] = base_score * weight
+        original_hits.sort(key=lambda h: h.get("weighted_score", 0), reverse=True)
 
-        all_hits.sort(key=lambda h: h["weighted_score"], reverse=True)
+        # Rerank: 使用重排序模型对检索结果进行精排
+        try:
+            # 提取文档内容用于重排序
+            documents = [hit.get("content", "") for hit in all_hits]
+            rerank_results = rerank_service.rerank(question, documents, top_n=15, return_documents=False)
+            
+            # 按重排序结果重新排列
+            reranked_hits = []
+            for result in rerank_results:
+                index = result.get("index", 0)
+                if 0 <= index < len(all_hits):
+                    hit = all_hits[index].copy()
+                    hit["rerank_score"] = result.get("relevance_score", 0)
+                    reranked_hits.append(hit)
+            
+            if reranked_hits:
+                all_hits = reranked_hits
+                
+                # 对比重排序和原始排序的差异
+                self._log_rerank_comparison(question, original_hits[:15], reranked_hits[:15])
+            else:
+                all_hits = original_hits
+        except Exception as e:
+            logger.warning("Rerank failed, using original order: %s", e)
+            all_hits = original_hits
+
         top_hits = all_hits[:15]
 
         # Update last_referenced_at (best effort)
@@ -107,6 +135,7 @@ class RAGService:
         try:
             answer = llm_service.rag_answer(context, question, history=history_text)
             answer = sanitize_output(answer)
+            logger.info("回答：%s", answer)
         except Exception as e:
             logger.error("RAG answer generation failed: %s", e)
             return "⚠️ 生成回答时出错，请稍后再试。"
@@ -221,6 +250,55 @@ class RAGService:
             parts.append(part)
 
         return "\n\n".join(parts)
+
+    def _log_rerank_comparison(self, question: str, original_hits: list[dict], reranked_hits: list[dict]) -> None:
+        """记录重排序和原始排序的对比日志"""
+        top_n = 15
+        logger.info("=" * 60)
+        logger.info("Rerank 对比分析 - 问题: %s", question[:50] + "..." if len(question) > 50 else question)
+        logger.info("-" * 60)
+        
+        # 原始排序 Top N
+        logger.info("【原始排序 Top %d】", top_n)
+        for i, hit in enumerate(original_hits[:top_n], 1):
+            source = hit.get("source_detail", hit.get("source", "unknown"))
+            topic = hit.get("topic", "unknown")[:30]
+            score = hit.get("weighted_score", hit.get("score", 0))
+            logger.info("  %d. %s - %s (score=%.4f)", i, source, topic, score)
+        
+        # 重排序 Top N
+        logger.info("【重排序 Top %d】", top_n)
+        for i, hit in enumerate(reranked_hits[:top_n], 1):
+            source = hit.get("source_detail", hit.get("source", "unknown"))
+            topic = hit.get("topic", "unknown")[:30]
+            rerank_score = hit.get("rerank_score", 0)
+            logger.info("  %d. %s - %s (rerank_score=%.4f)", i, source, topic, rerank_score)
+        
+        # 分析排序变化
+        original_top_ids = [h.get("id") for h in original_hits[:top_n]]
+        reranked_top_ids = [h.get("id") for h in reranked_hits[:top_n]]
+        
+        # 计算重叠率
+        overlap = len(set(original_top_ids) & set(reranked_top_ids))
+        overlap_rate = overlap / top_n * 100 if original_top_ids else 0
+        
+        # 计算排名变化
+        rank_changes = []
+        for i, hit in enumerate(reranked_hits[:top_n]):
+            hit_id = hit.get("id")
+            if hit_id in original_top_ids:
+                original_rank = original_top_ids.index(hit_id) + 1
+                new_rank = i + 1
+                change = original_rank - new_rank
+                rank_changes.append(change)
+        
+        avg_rank_change = sum(rank_changes) / len(rank_changes) if rank_changes else 0
+        
+        logger.info("-" * 60)
+        logger.info("【对比统计】")
+        logger.info("  Top %d 重叠率: %.0f%% (%d/%d)", top_n, overlap_rate, overlap, top_n)
+        logger.info("  平均排名变化: %.2f (正值=提升, 负值=下降)", avg_rank_change)
+        logger.info("=" * 60)
 
 
 rag_service = RAGService()

@@ -144,12 +144,11 @@ class LLMService:
 类型：{block_type}
 名称：{block_name}
 
-## 开发者信息
-{developer_info if developer_info else "暂无开发者信息记录。"}
-
 ```{language}
 {code}
 ```
+## 开发者信息
+{developer_info if developer_info else "暂无开发者信息记录。"}
 
 ## 要求
 生成的描述需要包含：
@@ -181,13 +180,15 @@ class LLMService:
 
 ## 参考资料
 {context}
-{history_section}## 用户问题
+{history_section}
+
+## 用户问题
 {question}
 
 ## 回答要求
 - 优先引用参考资料中的信息
-- 如果涉及代码，给出具体的文件路径和代码片段
 - 回答简洁准确，避免冗长
+- 默认使用通俗易懂的适合非技术人员理解的文字描述清楚逻辑和功能，仅当用户明确要求"代码细节"、"具体实现"、"源码"等技术细节时，才给出具体的文件路径和代码片段
 - 在回答末尾标注主要参考的知识来源
 """
         return self.chat([

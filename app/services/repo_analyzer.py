@@ -39,6 +39,7 @@ from app.services.cancel import CancelledError, check_cancelled
 from app.services.embedding_service import embedding_service
 from app.services.llm_service import llm_service
 from app.services.milvus_service import milvus_service
+from app.services.security_checker import security_checker
 
 logger = logging.getLogger(__name__)
 
@@ -47,9 +48,18 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 ALLOWED_EXTENSIONS = {
-    ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs",
-    ".cs", ".cpp", ".c", ".h", ".rb", ".php", ".swift", ".kt",
-    ".scala", ".vue", ".sql", ".proto", ".graphql",
+    # 主流编程语言
+    ".py", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts",
+    ".java", ".go", ".rs", ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hxx",
+    ".cs", ".rb", ".php", ".swift", ".kt", ".kts", ".scala", ".sc", ".lua",
+    # Web 开发
+    ".html", ".htm", ".vue", ".svelte",
+    # 配置文件
+    ".json", ".jsonl", ".yaml", ".yml", ".toml", ".properties",
+    # 数据库
+    ".sql",
+    # 其他语言
+    ".md",
 }
 
 BLACKLIST_DIRS = {
@@ -63,21 +73,52 @@ MAX_BLOCK_RETRY = 3  # Maximum number of retries for failed blocks
 MAX_FILE_SIZE = 100 * 1024  # 100KB
 MAX_LINE_LENGTH = 500
 
-SENSITIVE_PATTERNS = [
-    re.compile(r"""(password|passwd|pwd)\s*[=:]\s*['"][^'"]+['"]""", re.IGNORECASE),
-    re.compile(r"""(api_key|apikey|api-key)\s*[=:]\s*['"][^'"]+['"]""", re.IGNORECASE),
-    re.compile(r"""(secret|secret_key)\s*[=:]\s*['"][^'"]+['"]""", re.IGNORECASE),
-    re.compile(r"""(token|access_token|auth_token)\s*[=:]\s*['"][^'"]+['"]""", re.IGNORECASE),
-    re.compile(r"""Bearer\s+[A-Za-z0-9\-._~+/]+=*""", re.IGNORECASE),
-    re.compile(r"""(AKIA|ABIA|ACCA|ASIA)[A-Z0-9]{16}"""),
-]
-
 LANG_MAP: dict[str, str] = {
-    ".py": "python", ".js": "javascript", ".jsx": "javascript",
-    ".ts": "typescript", ".tsx": "tsx", ".java": "java",
-    ".go": "go", ".rs": "rust", ".c": "c", ".h": "c", ".cpp": "cpp",
-    ".cs": "c_sharp", ".rb": "ruby", ".php": "php",
-    ".swift": "swift", ".kt": "kotlin", ".scala": "scala",
+    # 主流编程语言
+    ".py": "python",
+    ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript", ".cjs": "javascript",
+    ".ts": "typescript", ".tsx": "tsx", ".mts": "typescript", ".cts": "typescript",
+    ".java": "java",
+    ".go": "go",
+    ".rs": "rust",
+    ".c": "c", ".h": "c",
+    ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp", ".hpp": "cpp", ".hxx": "cpp",
+    ".cs": "c_sharp",
+    ".rb": "ruby",
+    ".php": "php",
+    ".swift": "swift",
+    ".kt": "kotlin", ".kts": "kotlin",
+    ".scala": "scala", ".sc": "scala",
+    # 脚本语言
+    ".sh": "bash", ".bash": "bash", ".zsh": "bash",
+    ".lua": "lua",
+    # Web 开发
+    ".css": "css", ".scss": "scss", ".sass": "scss",
+    ".html": "html", ".htm": "html",
+    ".vue": "vue",
+    ".svelte": "svelte",
+    # 配置文件
+    ".json": "json", ".jsonl": "json",
+    ".yaml": "yaml", ".yml": "yaml",
+    ".toml": "toml",
+    ".xml": "xml",
+    # 数据库
+    ".sql": "sql",
+    # 其他语言
+    ".dart": "dart",
+    ".ex": "elixir", ".exs": "elixir",
+    ".erl": "erlang", ".hrl": "erlang",
+    ".ml": "ocaml", ".mli": "ocaml",
+    ".hs": "haskell",
+    ".zig": "zig",
+    ".sol": "solidity",
+    # 构建文件
+    "Dockerfile": "dockerfile",
+    ".dockerfile": "dockerfile",
+    "CMakeLists.txt": "cmake",
+    ".cmake": "cmake",
+    "Makefile": "make",
+    ".mk": "make",
 }
 
 # ---------------------------------------------------------------------------
@@ -133,12 +174,6 @@ def _format_duration(seconds: float) -> str:
     return f"约{m}分{s}秒"
 
 
-def _redact_sensitive(text: str) -> str:
-    for pattern in SENSITIVE_PATTERNS:
-        text = pattern.sub("[REDACTED]", text)
-    return text
-
-
 def _content_hash(code: str) -> str:
     """SHA-256 hex digest of code content."""
     return hashlib.sha256(code.encode("utf-8")).hexdigest()
@@ -180,6 +215,10 @@ class RepoAnalyzer:
         from app.services.debug_notifier import (
             clear_progress_msg, get_debug_chat_ids_for_repo, notify_repo,
         )
+
+        # 总耗时统计
+        total_start = time.time()
+        step_times: dict[str, float] = {}
 
         stats: dict[str, int] = {
             "files_parsed": 0, "blocks_found": 0, "blocks_success": 0,
@@ -239,6 +278,7 @@ class RepoAnalyzer:
             # ----------------------------------------------------------
             # Step 1: Git clone / pull
             # ----------------------------------------------------------
+            step_start = time.time()
             _check()
             _notify("📦 正在同步代码仓库", progress=True)
 
@@ -256,11 +296,14 @@ class RepoAnalyzer:
             else:
                 changed_files = None  # all files
 
+            step_times["git_sync"] = time.time() - step_start
+            logger.info("[性能] 步骤1 - Git同步完成，耗时 %.2fs", step_times["git_sync"])
             _notify("✅ 代码仓库同步完成", progress=True, done=True)
 
             # ----------------------------------------------------------
             # Step 2: Scan & filter files
             # ----------------------------------------------------------
+            step_start = time.time()
             _check()
             _notify("🔍 正在扫描代码库变更", progress=True)
 
@@ -280,11 +323,14 @@ class RepoAnalyzer:
 
             total_files = len(files_to_process)
             logger.info("Total files to process: %d", total_files)
+            step_times["scan_files"] = time.time() - step_start
+            logger.info("[性能] 步骤2 - 文件扫描完成，耗时 %.2fs，发现 %d 个文件", step_times["scan_files"], total_files)
             _notify("✅ 代码库扫描完成", progress=True, done=True)
 
             # ----------------------------------------------------------
             # Step 3: AST parse → code blocks
             # ----------------------------------------------------------
+            step_start = time.time()
             _check()
             new_blocks: list[dict[str, Any]] = []
             parse_throttle = _ProgressThrottle(total_files)
@@ -303,11 +349,14 @@ class RepoAnalyzer:
 
             if total_files:
                 _notify("✅ 解析完成", progress=True, done=True)
-                logger.info("Total blocks parsed: %d", len(new_blocks))
+                step_times["ast_parse"] = time.time() - step_start
+                logger.info("[性能] 步骤3 - AST解析完成，耗时 %.2fs，解析 %d 个代码块（%d 个文件）", step_times["ast_parse"], len(new_blocks), stats["files_parsed"])
+            logger.info("Total blocks parsed: %d", len(new_blocks))
 
             # ----------------------------------------------------------
             # Step 4: Upsert code_block records, detect what needs LLM
             # ----------------------------------------------------------
+            step_start = time.time()
             _check()
             blocks_to_generate = self._sync_code_blocks(
                 repo_id, new_blocks, current_commit, changed_files,
@@ -342,10 +391,13 @@ class RepoAnalyzer:
                         )
 
             stats["blocks_found"] = len(new_blocks) + len(retry_blocks)
+            step_times["sync_blocks"] = time.time() - step_start
+            logger.info("[性能] 步骤4 - 代码块同步完成，耗时 %.2fs，待生成 %d 个块", step_times["sync_blocks"], len(blocks_to_generate))
 
             # ----------------------------------------------------------
             # Step 5: LLM knowledge generation (block level)
             # ----------------------------------------------------------
+            step_start = time.time()
             _check()
             repo_map = self._generate_repo_map(repo_dir, all_files)
             logger.info("repo_map: %s", repo_map)
@@ -376,10 +428,13 @@ class RepoAnalyzer:
 
             # Always advance commit hash (file-level checkpoint)
             self._update_repo_commit(repo_id, current_commit)
+            step_times["llm_generate"] = time.time() - step_start
+            logger.info("[性能] 步骤5 - LLM知识生成完成，耗时 %.2fs，生成 %d 条知识", step_times["llm_generate"], stats["knowledge_generated"])
 
             # ----------------------------------------------------------
             # Step 6: Module summaries (cascading)
             # ----------------------------------------------------------
+            step_start = time.time()
             _check()
             affected_dirs = self._get_affected_modules(
                 repo_id, blocks_to_generate, changed_files,
@@ -391,10 +446,13 @@ class RepoAnalyzer:
                     check_cancelled_fn=_check,
                 )
                 stats["modules_updated"] = updated
+            step_times["module_summaries"] = time.time() - step_start
+            logger.info("[性能] 步骤6 - 模块摘要完成，耗时 %.2fs，更新 %d 个模块", step_times["module_summaries"], stats["modules_updated"])
 
             # ----------------------------------------------------------
             # Step 7: Repo overview (regenerate if anything changed)
             # ----------------------------------------------------------
+            step_start = time.time()
             _check()
             if blocks_to_generate or affected_dirs:
                 _notify("📋 正在生成概览...", progress=True)
@@ -404,8 +462,33 @@ class RepoAnalyzer:
                 except Exception:
                     logger.exception("Failed to regenerate repo overview for repo %d", repo_id)
                     _notify("⚠️ 概览生成失败", progress=True, done=True)
+            step_times["repo_overview"] = time.time() - step_start
+            logger.info("[性能] 步骤7 - 仓库概览完成，耗时 %.2fs", step_times["repo_overview"])
 
             self._finish_task_log(task_log_id, "success", stats)
+
+            # 总耗时统计
+            total_time = time.time() - total_start
+            step_times["total"] = total_time
+            logger.info("=" * 60)
+            logger.info("[性能] 代码库分析完成，repo_id=%d", repo_id)
+            logger.info("[性能] 总耗时: %.2fs", total_time)
+            logger.info("[性能] 各步骤耗时明细:")
+            step_names = {
+                "git_sync": "Git同步",
+                "scan_files": "文件扫描",
+                "ast_parse": "AST解析",
+                "sync_blocks": "代码块同步",
+                "llm_generate": "LLM知识生成",
+                "module_summaries": "模块摘要",
+                "repo_overview": "仓库概览",
+            }
+            for step_name, step_time in step_times.items():
+                if step_name != "total":
+                    pct = step_time / total_time * 100 if total_time > 0 else 0
+                    display_name = step_names.get(step_name, step_name)
+                    logger.info("[性能]   - %s: %.2fs (%.1f%%)", display_name, step_time, pct)
+            logger.info("=" * 60)
 
             logger.info(
                 "Repo analysis succeeded for repo_id=%d: %s", repo_id, stats,
@@ -622,16 +705,10 @@ class RepoAnalyzer:
         return os.path.relpath(fpath, repo_dir)
 
     # ================================================================== #
-    #  AST parsing                                                         #
+    #  AST parsing  解析文件，提取代码块                                      #
     # ================================================================== #
 
     def _parse_file(self, fpath: str, repo_dir: str, repo_id: int, file_commit: dict | None = None) -> list[dict[str, Any]]:
-        """
-        解析文件，提取代码块
-
-        Args:
-            file_commit: 包含 commit_hash, commit_author, commit_date, contributors 的字典
-        """
         ext = os.path.splitext(fpath)[1].lower()
         lang = LANG_MAP.get(ext)
         rel_path = self._relative_path(fpath, repo_dir)
@@ -640,7 +717,8 @@ class RepoAnalyzer:
                 source = f.read()
         except Exception:
             return []
-        source = _redact_sensitive(source)
+        # 使用增强的安全检查进行脱敏
+        source = security_checker.redact_sensitive(source)
         if not source.strip():
             logger.debug("Skipping empty file: %s", rel_path)
             return []
@@ -668,28 +746,58 @@ class RepoAnalyzer:
             return []
 
     def _load_ts_language(self, lang: str) -> Any:
-        try:
-            if lang == "python":
-                import tree_sitter_python; return tree_sitter_python.language()
-            elif lang == "javascript":
-                import tree_sitter_javascript; return tree_sitter_javascript.language()
-            elif lang == "typescript":
-                import tree_sitter_typescript; return tree_sitter_typescript.language_typescript()
-            elif lang == "tsx":
-                import tree_sitter_typescript; return tree_sitter_typescript.language_tsx()
-            elif lang == "java":
-                import tree_sitter_java; return tree_sitter_java.language()
-            elif lang == "go":
-                import tree_sitter_go; return tree_sitter_go.language()
-            elif lang == "rust":
-                import tree_sitter_rust; return tree_sitter_rust.language()
-            elif lang == "c":
-                import tree_sitter_c; return tree_sitter_c.language()
-            elif lang == "cpp":
-                import tree_sitter_cpp; return tree_sitter_cpp.language()
+        """加载 tree-sitter 语言支持，支持多种编程语言"""
+        # 语言包映射表：语言名 -> (包名, 语言获取方式)
+        language_map = {
+            "python": ("tree_sitter_python", "language"),
+            "javascript": ("tree_sitter_javascript", "language"),
+            "typescript": ("tree_sitter_typescript", "language_typescript"),
+            "tsx": ("tree_sitter_typescript", "language_tsx"),
+            "java": ("tree_sitter_java", "language"),
+            "go": ("tree_sitter_go", "language"),
+            "rust": ("tree_sitter_rust", "language"),
+            "c": ("tree_sitter_c", "language"),
+            "cpp": ("tree_sitter_cpp", "language"),
+            "c_sharp": ("tree_sitter_c_sharp", "language"),
+            "ruby": ("tree_sitter_ruby", "language"),
+            "php": ("tree_sitter_php", "language"),
+            "swift": ("tree_sitter_swift", "language"),
+            "kotlin": ("tree_sitter_kotlin", "language"),
+            "scala": ("tree_sitter_scala", "language"),
+            "bash": ("tree_sitter_bash", "language"),
+            "html": ("tree_sitter_html", "language"),
+            "json": ("tree_sitter_json", "language"),
+            "yaml": ("tree_sitter_yaml", "language"),
+            "toml": ("tree_sitter_toml", "language"),
+            "sql": ("tree_sitter_sql", "language"),
+            "lua": ("tree_sitter_lua", "language"),
+            "dart": ("tree_sitter_dart", "language"),
+            "elixir": ("tree_sitter_elixir", "language"),
+            "erlang": ("tree_sitter_erlang", "language"),
+            "ocaml": ("tree_sitter_ocaml", "language"),
+            "haskell": ("tree_sitter_haskell", "language"),
+            "zig": ("tree_sitter_zig", "language"),
+            "solidity": ("tree_sitter_solidity", "language"),
+            "vue": ("tree_sitter_vue", "language"),
+            "svelte": ("tree_sitter_svelte", "language"),
+            "dockerfile": ("tree_sitter_dockerfile", "language"),
+            "cmake": ("tree_sitter_cmake", "language"),
+            "make": ("tree_sitter_make", "language"),
+        }
+        
+        if lang not in language_map:
+            logger.debug("Unknown tree-sitter language: %s", lang)
             return None
+        
+        module_name, attr_name = language_map[lang]
+        try:
+            module = __import__(module_name)
+            return getattr(module, attr_name)()
         except ImportError:
-            logger.debug("tree-sitter language %s not installed", lang)
+            logger.debug("tree-sitter language %s not installed (package: %s)", lang, module_name)
+            return None
+        except AttributeError:
+            logger.debug("tree-sitter language %s has no attribute %s", module_name, attr_name)
             return None
 
     def _extract_blocks(self, node: Any, source: str, rel_path: str, repo_id: int, lang: str, blocks: list[dict[str, Any]], parent_class: str | None, file_commit: dict | None = None) -> None:
@@ -1156,7 +1264,8 @@ class RepoAnalyzer:
                     if os.path.exists(fpath):
                         with open(fpath, "r", errors="ignore") as f:
                             source = f.read()
-                        source = _redact_sensitive(source)
+                        # 使用增强的安全检查进行脱敏
+                        source = security_checker.redact_sensitive(source)
                         start = (block.get("start_line") or 1) - 1
                         end = block.get("end_line") or len(source.split("\n"))
                         code = "\n".join(source.split("\n")[start:end])

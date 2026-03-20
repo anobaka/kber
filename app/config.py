@@ -43,6 +43,11 @@ class Config:
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-v3")
     EMBEDDING_DIM: int = int(os.getenv("EMBEDDING_DIM", "1024"))
 
+    # --- Rerank ---
+    RERANK_API_KEY: str = os.getenv("RERANK_API_KEY", "")
+    RERANK_BASE_URL: str = os.getenv("RERANK_BASE_URL", "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank")
+    RERANK_MODEL: str = os.getenv("RERANK_MODEL", "gte-rerank-v2")
+
     # --- Git / Repo ---
     GIT_BASE_URL: str = os.getenv("GIT_BASE_URL", "")  # e.g. https://gitlab.mycompany.com
     GIT_PAT: str = os.getenv("GIT_PAT", "")
